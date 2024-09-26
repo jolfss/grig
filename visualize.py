@@ -8,6 +8,7 @@ from helpers import setup_camera, quat_mult
 from external import build_rotation
 from colormap import colormap
 from copy import deepcopy
+from cluster import get_colors, plot_elbow_graph
 
 RENDER_MODE = 'color'  # 'color', 'depth' or 'centers'
 # RENDER_MODE = 'depth'  # 'color', 'depth' or 'centers'
@@ -17,7 +18,7 @@ ADDITIONAL_LINES = None  # None, 'trajectories' or 'rotations'
 # ADDITIONAL_LINES = 'trajectories'  # None, 'trajectories' or 'rotations'
 # ADDITIONAL_LINES = 'rotations'  # None, 'trajectories' or 'rotations'
 
-REMOVE_BACKGROUND = False  # False or True
+REMOVE_BACKGROUND = True  # False or True
 # REMOVE_BACKGROUND = True  # False or True
 
 FORCE_LOOP = False  # False or True
@@ -43,8 +44,10 @@ def init_camera(y_angle=0., center_dist=2.4, cam_height=1.3, f_ratio=0.82):
     k = np.array([[f_ratio * w, 0, w / 2], [0, f_ratio * w, h / 2], [0, 0, 1]])
     return w2c, k
 
-
-def load_scene_data(seq, exp, seg_as_col=False):
+#---------------------------------#
+#   NOTE: Original source code.   #
+#---------------------------------#
+def __load_scene_data(seq, exp, seg_as_col=False):
     params = dict(np.load(f"./output/{exp}/{seq}/params.npz"))
     params = {k: torch.tensor(v).cuda().float() for k, v in params.items()}
     is_fg = params['seg_colors'][:, 0] > 0.5
@@ -53,6 +56,41 @@ def load_scene_data(seq, exp, seg_as_col=False):
         rendervar = {
             'means3D': params['means3D'][t],
             'colors_precomp': params['rgb_colors'][t] if not seg_as_col else params['seg_colors'],
+            'rotations': torch.nn.functional.normalize(params['unnorm_rotations'][t]),
+            'opacities': torch.sigmoid(params['logit_opacities']),
+            'scales': torch.exp(params['log_scales']),
+            'means2D': torch.zeros_like(params['means3D'][0], device="cuda")
+        }
+        if REMOVE_BACKGROUND:
+            rendervar = {k: v[is_fg] for k, v in rendervar.items()}
+        scene_data.append(rendervar)
+    if REMOVE_BACKGROUND:
+        is_fg = is_fg[is_fg]
+    return scene_data, is_fg
+
+#---------------------------------#
+#   NOTE: Custom-color testing.   #
+#---------------------------------#
+def load_scene_data(seq, exp, seg_as_col=False, use_elbow=True):
+    params = dict(np.load(f"./output/{exp}/{seq}/params.npz"))
+    params = {k: torch.tensor(v).cuda().float() for k, v in params.items()}
+    #breakpoint()
+
+    is_fg = params['seg_colors'][:, 0] > 0.5
+    scene_data = []
+    
+    optimal_k = 10 # User has to specify this if use_elbow is False
+
+    # Pass the elbow flag here
+    if use_elbow:
+        optimal_k = plot_elbow_graph(seq, exp, max_clusters=30, stride = 3)
+
+    colors = get_colors(seq, exp, num_clusters=optimal_k)
+
+    for t in range(len(params['means3D'])):
+        rendervar = {
+            'means3D': params['means3D'][t],
+            'colors_precomp': colors,
             'rotations': torch.nn.functional.normalize(params['unnorm_rotations'][t]),
             'opacities': torch.sigmoid(params['logit_opacities']),
             'scales': torch.exp(params['log_scales']),
@@ -234,5 +272,5 @@ def visualize(seq, exp):
 
 if __name__ == "__main__":
     exp_name = "pretrained"
-    for sequence in ["basketball", "boxes", "football", "juggle", "softball", "tennis"]:
+    for sequence in ["juggle", "softball", "tennis"]:
         visualize(sequence, exp_name)
