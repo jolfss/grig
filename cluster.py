@@ -1,90 +1,165 @@
-
 """Clustering module."""
-from typing import Tuple
+from typing import Dict, Tuple
 import numpy as np
 import torch
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+import matplotlib.cm as cm
 
-"""-----------------------------------------------------------------------------------
-One instant of the dynamic gaussian scene.
-All quantities below have an outer dimension of (N,) over the N gaussians.
-All tensors are on the CUDA device.
---------------------------------------------------------------------------------------
-scales : Tensor #[sx,sy,sz], values typically seem \in [0,1].
---------------------------------------------------------------------------------------
-positions : Tensor  #[x,y,z], y-vertical
---------------------------------------------------------------------------------------
-rotations : Tensor #quaternion? [x,y,z,w]?, TODO: not sure about convention here
---------------------------------------------------------------------------------------
-colors : Tensor # [r,g,b] NOTE: values \in (-inf?,inf?) but "intended" values are [0,1]
-                # values < 0 are black
-                # value == 1 has peak intensity in the center of the gaussian
-                # values >> 1 limits to a solid ellipse of peak intensity
-                # (values seen ranging in practice from ~250 to ~250).
---------------------------------------------------------------------------------------
-opacities : Tensor # opacities \in [0,1]
------------------------------------------------------------------------------------"""
-
+#NOTE modified from [load_scene_data] in visualize.py 
 @torch.no_grad()
-def extract_features(filepath:str):
+def clusterer(filepath_npz:str, K:int, timestride:int) -> Tuple[torch.Tensor, Dict[str,torch.Tensor]]:
     """
-    Expected format: (.npz)
-    Dimensions:
-        T: Number of timesteps
-        N: Number of gaussians
-    Contains     
-        KEY                 SHAPE    
-        means3D             (T,N,R^3)
-        unnorm_rotations    (T,N,R^4) --unnormalized quaternions
-        log_scales          (N,(0,inf.)^3?)
-        logit_opacities     (???)
-        colors_precomp      (N,R^3) --but [0,1]^3 is the intended domain
+    Requires (from .npz)
+        means3D (x,y,z) --note y is vertical
+        unnorm_rotations (quaternions qx, qy, qz, qw) --not sure if in this convention
+        log_scales (-inf,inf)
+        rgb_colors (-inf,inf) but [0,1] intended range (<0 black, 1 is peak intensity, >1 limits to solid ellipse of peak intensity)
+        logit_opacities (0,inf)
+    Returns
+        features: (N, T*10) Tensor@cuda [x, y, z, dxdt, dydt, dzdt, dqxdt, dqydt, dqzdt, dqwdt]
+        scene_data: Dict[str,Tensor@cuda]
     """
-    params = np.load(filepath)
-
-
-#NOTE modified from [load_scene_data] in ./Dynamic3DGaussians/visualize.py line 49
-@torch.no_grad()
-def load(seq, exp):
-    params = dict(np.load(F"./output/{exp}/{seq}/params.npz"))
+    print(F"[grig]: Opening {filepath_npz}")
+    params = dict(np.load(filepath_npz))
     params = {k: torch.tensor(v).cuda().float() for k, v in params.items()}
 
-    features = {
-        "position" : params["means3D"],
-        "position_dt": torch.gradient(params["means3D"], dim=0)[0],
-        "rotation_dt": torch.gradient(torch.nn.functional.normalize(params["unnorm_rotations"]), dim=0)[0]
-    }
+    print(F"[grig]: Preparing Features")
 
+
+    # prepare features
+    pos = params["means3D"]
+    rot = torch.nn.functional.normalize(params["unnorm_rotations"],dim=-1)
+    dpos_dt = torch.gradient(pos, dim=0)[0]
+    drot_dt = torch.gradient(rot ,dim=0)[0]
+
+    # check sizes
+    T_pos,  N_pos,  D_pos   = pos.size() 
+    T_posdt,N_posdt,D_posdt = dpos_dt.size()
+    T_rot,  N_rot,  D_rot   = rot.size()
+    T_rotdt,N_rotdt,D_rotdt = drot_dt.size()
+    assert T_pos == T_posdt == T_rot == T_rotdt >= 2
+    assert N_pos == N_posdt == N_rot == N_rotdt >= 2
+    assert D_pos == D_posdt == 3
+    assert D_rot == D_rotdt == 4
+    N=N_pos
+    T=T_pos 
+    features = torch.cat((pos[::timestride], dpos_dt[::timestride], drot_dt[::timestride]),dim=-1).permute(1,0,2).reshape((N,-1)) # -1 = feature_dim*T//timestride
+
+    # cluster
+    print(F"[grig]: Preprocessing Features")
+    scaler = StandardScaler()
+    features  = scaler.fit_transform(features.cpu().numpy())
+
+    print(F"[grig]: Clustering")
+    kmeans = KMeans(n_clusters=K)
+    kmeans.fit(features)
+
+    labels = kmeans.labels_
+    
+    cmap = cm.get_cmap('turbo', K)
+    colors = cmap(labels)[:,:3]
+    colors = torch.from_numpy(colors).float().to("cuda")
+
+    # prepare scene data
+    print(F"[grig]: Preparing Scene Data")
+    is_fg = params['seg_colors'][:, 0] > 0.5
+    scene_data = []
+    for t in range(len(params['means3D'])):
+        rendervar = {
+            'means3D':        params['means3D'][t],
+            'colors_precomp': colors,
+            'rotations':      rot[t],
+            'opacities': torch.sigmoid(params['logit_opacities']),
+            'scales':    torch.exp(params['log_scales']),
+            'means2D':   torch.zeros_like(params['means3D'][0], device="cuda")
+        }
+        rendervar = {k: v[is_fg] for k, v in rendervar.items()}
+        scene_data.append(rendervar)
+
+    return features, scene_data
+
+#NOTE modified from [load_scene_data] in visualize.py 
+@torch.no_grad()
+def clusterer_bgremoved(filepath_npz: str, K:int=32, timestride:int=2, remove_bg:bool=False) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
+    """
+    Requires (from .npz)
+        means3D (x,y,z) --note y is vertical
+        unnorm_rotations (quaternions qx, qy, qz, qw) --not sure if in this convention
+        log_scales (-inf,inf)
+        rgb_colors (-inf,inf) but [0,1] intended range (<0 black, 1 is peak intensity, >1 limits to solid ellipse of peak intensity)
+        logit_opacities (0,inf)
+    Returns
+        features: (N, T*10) Tensor@cuda [x, y, z, dxdt, dydt, dzdt, dqxdt, dqydt, dqzdt, dqwdt]
+        scene_data: Dict[str,Tensor@cuda]
+    """
+    print(F"[grig]: Opening {filepath_npz}")
+    params = dict(np.load(filepath_npz))
+    params = {k: torch.tensor(v).cuda().float() for k, v in params.items()}
+
+    print(F"[grig]: Preparing Features")
+
+    # prepare features
+    pos = params["means3D"]
+    rot = torch.nn.functional.normalize(params["unnorm_rotations"], dim=-1)
+    dpos_dt = torch.gradient(pos, dim=0)[0]
+    drot_dt = torch.gradient(rot, dim=0)[0]
+
+    ## size checks
+    T_pos, N_pos, D_pos = pos.size()
+    T_posdt, N_posdt, D_posdt = dpos_dt.size()
+    T_rot, N_rot, D_rot = rot.size()
+    T_rotdt, N_rotdt, D_rotdt = drot_dt.size()
+    assert T_pos == T_posdt == T_rot == T_rotdt >= 2
+    assert N_pos == N_posdt == N_rot == N_rotdt >= 2
+    assert D_pos == D_posdt == 3
+    assert D_rot == D_rotdt == 4
+    N = N_pos
+    T = T_pos
+    
+    features = torch.cat((pos[::timestride], dpos_dt[::timestride], drot_dt[::timestride]), dim=-1).permute(1, 0, 2).reshape((N, -1))  # -1 = feature_dim*T//timestride
+    
+    # cull bg
+    is_fg = params['seg_colors'][:, 0] > 0.5  
+    fg_features = features[is_fg]
+
+    print(F"[grig]: Preprocessing Foreground Features")
+    scaler = StandardScaler()
+    fg_features_scaled = scaler.fit_transform(fg_features.cpu().numpy())
+
+    # cluster
+    print(F"[grig]: Clustering Foreground Gaussians")
+    kmeans = KMeans(n_clusters=K)
+    kmeans.fit(fg_features_scaled)
+    fg_labels = kmeans.labels_
+
+    cmap = cm.get_cmap('turbo', K)
+    fg_colors = cmap(fg_labels)[:, :3]  
+    fg_colors = torch.from_numpy(fg_colors).float().to("cuda")
+
+    colors = params["rgb_colors"][0] #color is constant w.r.t. time  
+    colors[is_fg] = fg_colors  
+
+    clusters = torch.zeros((N, 1), device="cuda")
+
+    # prepare scene data
+    print(F"[grig]: Preparing Scene Data")
     scene_data = []
     for t in range(len(params['means3D'])):
         rendervar = {
             'means3D': params['means3D'][t],
-            'colors_precomp': params['rgb_colors'][t],
-            'rotations': torch.nn.functional.normalize(params['unnorm_rotations'][t]),
+            'colors_precomp': colors,
+            'rotations': rot[t],
             'opacities': torch.sigmoid(params['logit_opacities']),
             'scales': torch.exp(params['log_scales']),
             'means2D': torch.zeros_like(params['means3D'][0], device="cuda")
         }
+        if remove_bg:
+            rendervar = {k: v[is_fg] for k, v in rendervar.items()}  
         scene_data.append(rendervar)
-    return scene_data, features
 
-import torch
-import numpy as np
-from sklearn.cluster import KMeans
-from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
-import matplotlib.pyplot as plt
+    return scene_data, features, clusters
 
-
-def prepare_data(features, t=70):
-    # Extract derivatives
-
-    position = torch.flatten(features['position'][::150], start_dim=0, end_dim=1)
-    position_dt = torch.flatten(features['position_dt'][::150], start_dim=0, end_dim=1)
-    rotation_dt = torch.flatten(features['rotation_dt'][::150], start_dim=0, end_dim=1)
-
-    # Concatenate to form the 10-dimensional data
-    data = torch.cat([position, position_dt, rotation_dt], dim=1)
-    return data
 
 
 # Function to plot the elbow graph

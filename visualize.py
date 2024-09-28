@@ -8,7 +8,7 @@ from helpers import setup_camera, quat_mult
 from external import build_rotation
 from colormap import colormap
 from copy import deepcopy
-from cluster import get_colors, plot_elbow_graph
+from cluster import clusterer_bgremoved, get_colors, plot_elbow_graph
 
 RENDER_MODE = 'color'  # 'color', 'depth' or 'centers'
 # RENDER_MODE = 'depth'  # 'color', 'depth' or 'centers'
@@ -74,7 +74,6 @@ def __load_scene_data(seq, exp, seg_as_col=False):
 def load_scene_data(seq, exp, seg_as_col=False, use_elbow=True):
     params = dict(np.load(f"./output/{exp}/{seq}/params.npz"))
     params = {k: torch.tensor(v).cuda().float() for k, v in params.items()}
-    #breakpoint()
 
     is_fg = params['seg_colors'][:, 0] > 0.5
     scene_data = []
@@ -102,7 +101,6 @@ def load_scene_data(seq, exp, seg_as_col=False, use_elbow=True):
     if REMOVE_BACKGROUND:
         is_fg = is_fg[is_fg]
     return scene_data, is_fg
-
 
 def make_lineset(all_pts, cols, num_lines):
     linesets = []
@@ -270,7 +268,72 @@ def visualize(seq, exp):
     del render_options
 
 
+def sean_visualize(filepath):
+    scene_data, features, clusters  = clusterer_bgremoved(filepath)
+
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(width=int(w * view_scale), height=int(h * view_scale), visible=True)
+
+    w2c, k = init_camera()
+    im, depth = render(w2c, k, scene_data[0])
+    init_pts, init_cols = rgbd2pcd(im, depth, w2c, k, show_depth=(RENDER_MODE == 'depth'))
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = init_pts
+    pcd.colors = init_cols
+    vis.add_geometry(pcd)
+
+    view_k = k * view_scale
+    view_k[2, 2] = 1
+    view_control = vis.get_view_control()
+    cparams = o3d.camera.PinholeCameraParameters()
+    cparams.extrinsic = w2c
+    cparams.intrinsic.intrinsic_matrix = view_k
+    cparams.intrinsic.height = int(h * view_scale)
+    cparams.intrinsic.width = int(w * view_scale)
+    view_control.convert_from_pinhole_camera_parameters(cparams, allow_arbitrary=True)
+
+    render_options = vis.get_render_option()
+    render_options.point_size = view_scale
+    render_options.light_on = False
+
+    start_time = time.time()
+    num_timesteps = len(scene_data)
+    while True:
+        passed_time = time.time() - start_time
+        passed_frames = passed_time * fps
+        t = int(passed_frames % num_timesteps)
+
+        if FORCE_LOOP:
+            num_loops = 1.4
+            y_angle = 360*t*num_loops / num_timesteps
+            w2c, k = init_camera(y_angle)
+            cam_params = view_control.convert_to_pinhole_camera_parameters()
+            cam_params.extrinsic = w2c
+            view_control.convert_from_pinhole_camera_parameters(cam_params, allow_arbitrary=True)
+        else:  # Interactive control
+            cam_params = view_control.convert_to_pinhole_camera_parameters()
+            view_k = cam_params.intrinsic.intrinsic_matrix
+            k = view_k / view_scale
+            k[2, 2] = 1
+            w2c = cam_params.extrinsic
+
+        im, depth = render(w2c, k, scene_data[t])
+        pts, cols = rgbd2pcd(im, depth, w2c, k, show_depth=(RENDER_MODE == 'depth'))
+        pcd.points = pts
+        pcd.colors = cols
+        vis.update_geometry(pcd)
+
+        if not vis.poll_events():
+            break
+        vis.update_renderer()
+
+    vis.destroy_window()
+    del view_control
+    del vis
+    del render_options
+
 if __name__ == "__main__":
-    exp_name = "pretrained"
-    for sequence in ["juggle", "softball", "tennis"]:
-        visualize(sequence, exp_name)
+    # exp_name = "pretrained"
+    # for sequence in ["juggle", "softball", "tennis"]:
+    #     visualize(sequence, exp_name)
+    sean_visualize("./output/pretrained/basketball/params.npz")
