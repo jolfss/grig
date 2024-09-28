@@ -24,6 +24,24 @@ colors : Tensor # [r,g,b] NOTE: values \in (-inf?,inf?) but "intended" values ar
 opacities : Tensor # opacities \in [0,1]
 -----------------------------------------------------------------------------------"""
 
+@torch.no_grad()
+def extract_features(filepath:str):
+    """
+    Expected format: (.npz)
+    Dimensions:
+        T: Number of timesteps
+        N: Number of gaussians
+    Contains     
+        KEY                 SHAPE    
+        means3D             (T,N,R^3)
+        unnorm_rotations    (T,N,R^4) --unnormalized quaternions
+        log_scales          (N,(0,inf.)^3?)
+        logit_opacities     (???)
+        colors_precomp      (N,R^3) --but [0,1]^3 is the intended domain
+    """
+    params = np.load(filepath)
+
+
 #NOTE modified from [load_scene_data] in ./Dynamic3DGaussians/visualize.py line 49
 @torch.no_grad()
 def load(seq, exp):

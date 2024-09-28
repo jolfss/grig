@@ -1,4 +1,4 @@
-name: dynamic_gaussians
+name: grig 
 channels:
   - pytorch
   - conda-forge
