@@ -118,7 +118,7 @@ def clusterer_bgremoved(filepath_npz: str, K:int=32, timestride:int=2, remove_bg
     T = T_pos
     
     features = torch.cat((pos[::timestride], dpos_dt[::timestride], drot_dt[::timestride]), dim=-1).permute(1, 0, 2).reshape((N, -1))  # -1 = feature_dim*T//timestride
-    
+     
     # cull bg
     is_fg = params['seg_colors'][:, 0] > 0.5  
     fg_features = features[is_fg]
@@ -161,43 +161,54 @@ def clusterer_bgremoved(filepath_npz: str, K:int=32, timestride:int=2, remove_bg
     return scene_data, features, clusters
 
 
+#NOTE Still using the sklearn algo, which is not the best ... Will customize if necessary :)
+def plot_elbow_graph(filepath_npz, max_clusters = 10, stride= 1):
+    """
+    Plots the elbow graph to determine the optimal number of clusters, after removing the background.
+    
+    Parameters:
+    - filepath_npz: Path to the .npz file containing scene data.
+    - max_clusters: Maximum number of clusters to test for.
+    - stride: Step size for testing different numbers of clusters.
 
-# Function to plot the elbow graph
-def plot_elbow_graph(seq, exp, max_clusters=10, stride=1):
-    _, dt = load(seq, exp)
-    data = prepare_data(dt)
-    # Convert to NumPy array
-    data_np = data.cpu().numpy()
+    Returns:
+    - Optimal number of clusters determined using the elbow method.
+    """
 
-    # Step 2: Preprocess the Data
+    # print(f"[DEBUG]: Max_cluster: {max_clusters}, stride: {stride}")
+
+    print(f"[grig]: Opening {filepath_npz}")
+    params = dict(np.load(filepath_npz))
+    params = {k: torch.tensor(v).cuda().float() for k, v in params.items()}
+
+    pos = params["means3D"]
+    rot = torch.nn.functional.normalize(params["unnorm_rotations"], dim=-1)
+    dpos_dt = torch.gradient(pos, dim=0)[0]
+    drot_dt = torch.gradient(rot, dim=0)[0]
+
+    features = torch.cat((pos, dpos_dt, drot_dt), dim=-1).permute(1, 0, 2).reshape(pos.size(1), -1)
+    
+    # Remove background
+    is_fg = params['seg_colors'][:, 0] > 0.5
+    fg_features = features[is_fg]
+
+    print("[grig]: Preprocessing foreground features for Elbow Method")
     scaler = StandardScaler()
-    data_scaled = scaler.fit_transform(data_np)
+    fg_features_scaled = scaler.fit_transform(fg_features.cpu().numpy())
 
-    # Step 3: Elbow Method for optimal K
     wcss = []
     for i in range(1, max_clusters + 1, stride):
         kmeans = KMeans(n_clusters=i, random_state=42)
-        kmeans.fit(data_scaled)
+        kmeans.fit(fg_features_scaled)
         wcss.append(kmeans.inertia_)
-        print(f'{i} Clusters: WCSS = {kmeans.inertia_}')
+        print(f'{i} [elbow]: Clusters: WCSS = {kmeans.inertia_}')
 
-    # Step 4: Automatically detect the elbow using the second derivative
     first_derivative = np.diff(wcss)
     second_derivative = np.diff(first_derivative)
     elbow_index = np.argmin(second_derivative) + 1
 
-    # Step 5: Plot the elbow graph with the detected elbow point
-    # plt.figure(figsize=(8, 5))
-    # plt.plot(range(1, max_clusters + 1, stride), wcss, marker='o', label='WCSS')
-    # plt.axvline(x=elbow_index, color='red', linestyle='--', label='Elbow Point')
-    # plt.title('Elbow Method for Optimal K')
-    # plt.xlabel('Number of clusters')
-    # plt.ylabel('WCSS (Inertia)')
-    # plt.grid(True)
-    # plt.legend()
-    # plt.show()
-
     print(f"Optimal number of clusters (Elbow Point): {elbow_index}")
+    
     return elbow_index
 
 

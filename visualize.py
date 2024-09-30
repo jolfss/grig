@@ -268,8 +268,14 @@ def visualize(seq, exp):
     del render_options
 
 
-def sean_visualize(filepath):
-    scene_data, features, clusters  = clusterer_bgremoved(filepath)
+def sean_visualize(filepath, use_elbow=False):
+    # Default number of clusters if elbow is not used
+    optimal_k = 32 # Evan's note: This is the K you set for default :)
+
+    if use_elbow:
+        optimal_k = plot_elbow_graph(filepath, max_clusters=15, stride=2)
+    
+    scene_data, features, clusters  = clusterer_bgremoved(filepath, K=optimal_k)
 
     vis = o3d.visualization.Visualizer()
     vis.create_window(width=int(w * view_scale), height=int(h * view_scale), visible=True)
