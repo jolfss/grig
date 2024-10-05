@@ -1,4 +1,5 @@
 
+from typing import Optional
 import torch
 import numpy as np
 import open3d as o3d
@@ -268,14 +269,12 @@ def visualize(seq, exp):
     del render_options
 
 
-def sean_visualize(filepath, use_elbow=False):
+def sean_visualize(filepath, use_elbow:Optional[int]=None):
     # Default number of clusters if elbow is not used
-    optimal_k = 32 # Evan's note: This is the K you set for default :)
+    K = use_elbow if use_elbow \
+        else plot_elbow_graph(filepath, max_clusters=15, stride=2) 
 
-    if use_elbow:
-        optimal_k = plot_elbow_graph(filepath, max_clusters=15, stride=2)
-    
-    scene_data, features, clusters  = clusterer_bgremoved(filepath, K=optimal_k)
+    scene_data, features, clusters, cluster_centers  = clusterer_bgremoved(filepath, K=K, remove_bg=True)
 
     vis = o3d.visualization.Visualizer()
     vis.create_window(width=int(w * view_scale), height=int(h * view_scale), visible=True)
@@ -287,6 +286,18 @@ def sean_visualize(filepath, use_elbow=False):
     pcd.points = init_pts
     pcd.colors = init_cols
     vis.add_geometry(pcd)
+    
+    #---------------------EDITS
+    # Initialize the sphere list and store the sphere geometries
+    spheres = []
+
+    # Create spheres for all cluster centers
+    for _ in range(K):
+        sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.005)  # Adjust the radius as needed
+        sphere.paint_uniform_color([1, 1, 1])  # Color the sphere red
+        spheres.append(sphere)
+        vis.add_geometry(sphere)
+    #--------------------------
 
     view_k = k * view_scale
     view_k[2, 2] = 1
@@ -323,11 +334,32 @@ def sean_visualize(filepath, use_elbow=False):
             k[2, 2] = 1
             w2c = cam_params.extrinsic
 
+        # Render Gaussian Splat
         im, depth = render(w2c, k, scene_data[t])
         pts, cols = rgbd2pcd(im, depth, w2c, k, show_depth=(RENDER_MODE == 'depth'))
-        pcd.points = pts
+        pcd.points = pts  
         pcd.colors = cols
         vis.update_geometry(pcd)
+
+        #-------------------------#
+        #  centers visualization  #
+        #-------------------------#
+        centers = torch.cat([cluster_centers[t],torch.ones((K,1))],dim=-1) # (K,4)
+        centers = centers.numpy() @ w2c.T
+        centers[:,:3] *= 0.25
+        centers = centers @ np.linalg.inv(w2c).T
+        
+        # Update the position of each sphere based on the camera coordinates
+        for c in range(K):
+            spheres[c].translate(centers[c,:3], relative=False)
+
+            # Update each sphere individually in the visualizer
+            vis.update_geometry(spheres[c])
+
+        # NOTE: The below code is the world->pixel transformation; but o3d does not support plotting
+        # at (x,y) locations. We instead need to fudge it by projecting to a small z-depth as done above.
+        # homogenous_centers_image = homogenous_centers_camera[:3,:3] @ k.T
+        # centers_projected = homogenous_centers_image[:,:2] / homogenous_centers_image[:,2:]
 
         if not vis.poll_events():
             break
@@ -342,4 +374,4 @@ if __name__ == "__main__":
     # exp_name = "pretrained"
     # for sequence in ["juggle", "softball", "tennis"]:
     #     visualize(sequence, exp_name)
-    sean_visualize("./output/pretrained/basketball/params.npz")
+    sean_visualize("./output/pretrained/football/params.npz", 32)
