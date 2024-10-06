@@ -173,213 +173,95 @@ def rgbd2pcd(im, depth, w2c, k, show_depth=False, project_to_cam_w_scale=None):
     cols = o3d.utility.Vector3dVector(cols.contiguous().double().cpu().numpy())
     return pts, cols
 
+def search(filepath, K:int=20):
+    for POS, DPOS, DROT in zip([1/100],[1],[1]):
+        params = {
+            "timestride":1,
+            "POS":np.exp(POS-5),
+            "DPOS":1,
+            "DROT":1
+        }
+        scene_data, _, _, cluster_centers  = cluster(filepath, **params)
 
-def visualize(seq, exp):
-    scene_data, is_fg = load_scene_data(seq, exp)
+        vis = o3d.visualization.Visualizer()
+        vis.create_window(width=int(320 * view_scale), height=int(h * view_scale), visible=True)
 
-    vis = o3d.visualization.Visualizer()
-    vis.create_window(width=int(w * view_scale), height=int(h * view_scale), visible=True)
+        def init_camera(y_angle=0., center_dist=3, cam_height=0.75, f_ratio=0.9):
+            ry = y_angle * np.pi / 180
+            w2c = np.array([[np.cos(ry), 0., -np.sin(ry), 0.],
+                            [0.,         1., 0.,          cam_height],
+                            [np.sin(ry), 0., np.cos(ry),  center_dist],
+                            [0.,         0., 0.,          1.]])
+            k = np.array([[f_ratio * w, 0, w / 2], [0, f_ratio * w, h / 2], [0, 0, 1]])
+            return w2c, k
+        
+        w2c, k = init_camera()
+        im, depth = render(w2c, k, scene_data[0])
+        init_pts, init_cols = rgbd2pcd(im, depth, w2c, k, show_depth=(RENDER_MODE == 'depth'))
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = init_pts
+        pcd.colors = init_cols
+        vis.add_geometry(pcd)
+        
+        spheres = []
+        for _ in range(K):
+            sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.005)  # Adjust the radius as needed
+            sphere.paint_uniform_color([1, 1, 1])  # Color the sphere red
+            spheres.append(sphere)
+            vis.add_geometry(sphere)
 
-    w2c, k = init_camera()
-    im, depth = render(w2c, k, scene_data[0])
-    init_pts, init_cols = rgbd2pcd(im, depth, w2c, k, show_depth=(RENDER_MODE == 'depth'))
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = init_pts
-    pcd.colors = init_cols
-    vis.add_geometry(pcd)
+        view_k = k * view_scale
+        view_k[2, 2] = 1
+        view_control = vis.get_view_control()
+        cparams = o3d.camera.PinholeCameraParameters()
+        cparams.extrinsic = w2c
+        cparams.intrinsic.intrinsic_matrix = view_k
+        cparams.intrinsic.height = int(h * view_scale)
+        cparams.intrinsic.width = int(w * view_scale)
+        view_control.convert_from_pinhole_camera_parameters(cparams, allow_arbitrary=True)
 
-    linesets = None
-    lines = None
-    if ADDITIONAL_LINES is not None:
-        if ADDITIONAL_LINES == 'trajectories':
-            linesets = calculate_trajectories(scene_data, is_fg)
-        elif ADDITIONAL_LINES == 'rotations':
-            linesets = calculate_rot_vec(scene_data, is_fg)
-        lines = o3d.geometry.LineSet()
-        lines.points = linesets[0].points
-        lines.colors = linesets[0].colors
-        lines.lines = linesets[0].lines
-        vis.add_geometry(lines)
+        render_options = vis.get_render_option()
+        render_options.point_size = view_scale
+        render_options.light_on = False
 
-    view_k = k * view_scale
-    view_k[2, 2] = 1
-    view_control = vis.get_view_control()
-    cparams = o3d.camera.PinholeCameraParameters()
-    cparams.extrinsic = w2c
-    cparams.intrinsic.intrinsic_matrix = view_k
-    cparams.intrinsic.height = int(h * view_scale)
-    cparams.intrinsic.width = int(w * view_scale)
-    view_control.convert_from_pinhole_camera_parameters(cparams, allow_arbitrary=True)
+        start_time = time.time()
+        num_timesteps = len(scene_data)
 
-    render_options = vis.get_render_option()
-    render_options.point_size = view_scale
-    render_options.light_on = False
-
-    start_time = time.time()
-    num_timesteps = len(scene_data)
-    while True:
-        passed_time = time.time() - start_time
-        passed_frames = passed_time * fps
-        if ADDITIONAL_LINES == 'trajectories':
-            t = int(passed_frames % (num_timesteps - traj_length)) + traj_length  # Skip t that don't have full traj.
-        else:
-            t = int(passed_frames % num_timesteps)
-
-        if FORCE_LOOP:
-            num_loops = 1.4
-            y_angle = 360*t*num_loops / num_timesteps
-            w2c, k = init_camera(y_angle)
-            cam_params = view_control.convert_to_pinhole_camera_parameters()
-            cam_params.extrinsic = w2c
-            view_control.convert_from_pinhole_camera_parameters(cam_params, allow_arbitrary=True)
-        else:  # Interactive control
-            cam_params = view_control.convert_to_pinhole_camera_parameters()
-            view_k = cam_params.intrinsic.intrinsic_matrix
-            k = view_k / view_scale
-            k[2, 2] = 1
-            w2c = cam_params.extrinsic
-
-        if RENDER_MODE == 'centers':
-            pts = o3d.utility.Vector3dVector(scene_data[t]['means3D'].contiguous().double().cpu().numpy())
-            cols = o3d.utility.Vector3dVector(scene_data[t]['colors_precomp'].contiguous().double().cpu().numpy())
-        else:
-            im, depth = render(w2c, k, scene_data[t])
-            pts, cols = rgbd2pcd(im, depth, w2c, k, show_depth=(RENDER_MODE == 'depth'))
-        pcd.points = pts
-        pcd.colors = cols
-        vis.update_geometry(pcd)
-
-        if ADDITIONAL_LINES is not None:
-            if ADDITIONAL_LINES == 'trajectories':
-                lt = t - traj_length
-            else:
-                lt = t
-            lines.points = linesets[lt].points
-            lines.colors = linesets[lt].colors
-            lines.lines = linesets[lt].lines
-            vis.update_geometry(lines)
-
-        if not vis.poll_events():
-            break
-        vis.update_renderer()
-
-    vis.destroy_window()
-    del view_control
-    del vis
-    del render_options
-
-
-def sean_visualize(filepath, use_elbow:Optional[int]=None):
-    # Default number of clusters if elbow is not used
-    K = use_elbow if use_elbow \
-        else plot_elbow_graph(filepath, max_clusters=15, stride=2) 
-
-    params = {
-        "timestride":1,
-        "POS":1,
-        "DPOS":1,
-        "DROT":1,
-        "K":K,
-        "remove_bg":False,
-    }
-    scene_data, _, _, cluster_centers  = cluster(filepath, **params)
-
-    vis = o3d.visualization.Visualizer()
-    vis.create_window(width=int(w * view_scale), height=int(h * view_scale), visible=True)
-
-    w2c, k = init_camera()
-    im, depth = render(w2c, k, scene_data[0])
-    init_pts, init_cols = rgbd2pcd(im, depth, w2c, k, show_depth=(RENDER_MODE == 'depth'))
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = init_pts
-    pcd.colors = init_cols
-    vis.add_geometry(pcd)
-    
-    #---------------------EDITS
-    # Initialize the sphere list and store the sphere geometries
-    spheres = []
-
-    # Create spheres for all cluster centers
-    for _ in range(K):
-        sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.005)  # Adjust the radius as needed
-        sphere.paint_uniform_color([1, 1, 1])  # Color the sphere red
-        spheres.append(sphere)
-        vis.add_geometry(sphere)
-    #--------------------------
-
-    view_k = k * view_scale
-    view_k[2, 2] = 1
-    view_control = vis.get_view_control()
-    cparams = o3d.camera.PinholeCameraParameters()
-    cparams.extrinsic = w2c
-    cparams.intrinsic.intrinsic_matrix = view_k
-    cparams.intrinsic.height = int(h * view_scale)
-    cparams.intrinsic.width = int(w * view_scale)
-    view_control.convert_from_pinhole_camera_parameters(cparams, allow_arbitrary=True)
-
-    render_options = vis.get_render_option()
-    render_options.point_size = view_scale
-    render_options.light_on = False
-
-    start_time = time.time()
-    num_timesteps = len(scene_data)
-    while True:
         passed_time = time.time() - start_time
         passed_frames = passed_time * fps
         t = int(passed_frames % num_timesteps)
 
-        if FORCE_LOOP:
-            num_loops = 1.4
-            y_angle = 360*t*num_loops / num_timesteps
-            w2c, k = init_camera(y_angle)
-            cam_params = view_control.convert_to_pinhole_camera_parameters()
-            cam_params.extrinsic = w2c
-            view_control.convert_from_pinhole_camera_parameters(cam_params, allow_arbitrary=True)
-        else:  # Interactive control
-            cam_params = view_control.convert_to_pinhole_camera_parameters()
-            view_k = cam_params.intrinsic.intrinsic_matrix
-            k = view_k / view_scale
-            k[2, 2] = 1
-            w2c = cam_params.extrinsic
+        cam_params = view_control.convert_to_pinhole_camera_parameters()
+        view_k = cam_params.intrinsic.intrinsic_matrix
+        k = view_k / view_scale
+        k[2, 2] = 1
+        w2c = cam_params.extrinsic
 
-        # Render Gaussian Splat
         im, depth = render(w2c, k, scene_data[t])
         pts, cols = rgbd2pcd(im, depth, w2c, k, show_depth=(RENDER_MODE == 'depth'))
         pcd.points = pts  
         pcd.colors = cols
         vis.update_geometry(pcd)
 
-        #-------------------------#
-        #  centers visualization  #
-        #-------------------------#
         centers = torch.cat([cluster_centers[t],torch.ones((K,1))],dim=-1) # (K,4)
         centers = centers.numpy() @ w2c.T
         centers[:,:3] *= 0.25
         centers = centers @ np.linalg.inv(w2c).T
         
-        # Update the position of each sphere based on the camera coordinates
         for c in range(K):
             spheres[c].translate(centers[c,:3], relative=False)
-
-            # Update each sphere individually in the visualizer
             vis.update_geometry(spheres[c])
-
-        # NOTE: The below code is the world->pixel transformation; but o3d does not support plotting
-        # at (x,y) locations. We instead need to fudge it by projecting to a small z-depth as done above.
-        # homogenous_centers_image = homogenous_centers_camera[:3,:3] @ k.T
-        # centers_projected = homogenous_centers_image[:,:2] / homogenous_centers_image[:,2:]
 
         if not vis.poll_events():
             break
         vis.update_renderer()
 
-    vis.destroy_window()
-    del view_control
-    del vis
-    del render_options
+        vis.capture_screen_image(F"hpsearch/POS={POS}_DPOS={DPOS}_DROT={DROT}.png")
+
+        vis.destroy_window()
+        del view_control
+        del vis
+        del render_options
 
 if __name__ == "__main__":
-    # exp_name = "pretrained"
-    # for sequence in ["juggle", "softball", "tennis"]:
-    #     visualize(sequence, exp_name)
-    sean_visualize("./output/pretrained/softball/params.npz", 26)
+    search("./output/pretrained/softball/params.npz")

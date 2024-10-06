@@ -7,9 +7,19 @@ from sklearn.preprocessing import StandardScaler
 import matplotlib.cm as cm
 
 
+default_params = {
+    "K":24,
+    "timestride":1,
+    "POS":1,
+    "DPOS":1,
+    "DROT":1,
+    "remove_bg":True,
+    "normalize_features":False
+}
+
 #NOTE modified from [load_scene_data] in visualize.py 
 @torch.no_grad()
-def clusterer_bgremoved(filepath_npz: str, K:int=32, timestride:int=2, remove_bg:bool=False) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
+def cluster(filepath_npz, K:int=26, timestride:int=1, POS:float=1.0, DPOS:float=1.0, DROT:float=1.0, remove_bg:bool=True, normalize_features:bool=False) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Requires (from .npz)
         means3D (x,y,z) --note y is vertical
@@ -23,17 +33,26 @@ def clusterer_bgremoved(filepath_npz: str, K:int=32, timestride:int=2, remove_bg
     """
     print(F"[grig]: Opening {filepath_npz}")
     params = dict(np.load(filepath_npz))
+
     params = {k: torch.tensor(v).cuda().float() for k, v in params.items()}
+    print(F"""\
+[grig]: Experiment Parameters:
+    K = {K}
+    timestride = {timestride}
+    POS = {POS}
+    DPOS = {DPOS}
+    DROT = {DROT} 
+    remove_bg = {remove_bg}\
+""")
 
     print(F"[grig]: Preparing Features")
-
     # prepare features
     pos = params["means3D"]
     rot = torch.nn.functional.normalize(params["unnorm_rotations"], dim=-1)
-    dpos_dt = torch.gradient(pos, dim=0)[0]
-    drot_dt = torch.gradient(rot, dim=0)[0]
+    dpos_dt = torch.gradient(pos, dim=0)[0] * 30 # NOTE: Adjustment for dt
+    drot_dt = torch.gradient(rot, dim=0)[0] * 30
 
-    ## size checks
+    # size checks
     T_pos, N_pos, D_pos = pos.size()
     T_posdt, N_posdt, D_posdt = dpos_dt.size()
     T_rot, N_rot, D_rot = rot.size()
@@ -44,33 +63,38 @@ def clusterer_bgremoved(filepath_npz: str, K:int=32, timestride:int=2, remove_bg
     assert D_rot == D_rotdt == 4
     N = N_pos
     T = T_pos
+    
+    features = torch.cat((
+        POS*pos[::timestride], 
+        DPOS*dpos_dt[::timestride], 
+        DROT*drot_dt[::timestride]), dim=-1).permute(1, 0, 2).reshape((N, -1))  # -1 = feature_dim*T//timestride
 
-    features = torch.cat((pos[::timestride], dpos_dt[::timestride], drot_dt[::timestride]), dim=-1).permute(1, 0, 2).reshape((N, -1))  # -1 = feature_dim*T//timestride
-    #NOROTATION
-    #features = torch.cat((pos[::timestride], dpos_dt[::timestride]), dim=-1).permute(1, 0, 2).reshape((N, -1))  # -1 = feature_dim*T//timestride
-    #NOPOSITION
-    #features = torch.cat((dpos_dt[::timestride], drot_dt[::timestride]), dim=-1).permute(1, 0, 2).reshape((N, -1))  # -1 = feature_dim*T//timestride
-     
     # cull bg
     is_fg = params['seg_colors'][:, 0] > 0.5  
     fg_features = features[is_fg]
 
     print(F"[grig]: Preprocessing Foreground Features")
     scaler = StandardScaler()
-    fg_features_scaled = scaler.fit_transform(fg_features.cpu().numpy())
+    fg_features = fg_features.cpu().numpy()
+    fg_features = scaler.fit_transform(fg_features)
 
     # cluster
     print(F"[grig]: Clustering Foreground Gaussians")
     kmeans = KMeans(n_clusters=K)
-    kmeans.fit(fg_features_scaled)
+    kmeans.fit(fg_features)
     fg_labels = kmeans.labels_
 
+    #COLOR MODES
     cmap = cm.get_cmap('turbo', K)
-    fg_colors = cmap(fg_labels)[:, :3]  
-    fg_colors = torch.from_numpy(fg_colors).float().to("cuda")
+    #CLUSTER COLORS
+    cluster_colors = cmap(fg_labels)[:, :3]  
+    feature_colors = torch.from_numpy(cluster_colors).float().to("cuda").expand((150,-1,3))
+    #ROTATION COLORS
+    #feature_colors = rot[:,:,:3][:,is_fg] #(T,N[is_fg],3)
 
-    colors = params["rgb_colors"][0] #color is constant w.r.t. time  
-    colors[is_fg] = fg_colors  
+
+    colors = params["rgb_colors"] #NOTE: color is constant w.r.t. time 
+    colors[:,is_fg] = feature_colors #NOTE: Should be a FPS correction
 
     cluster_labels = torch.zeros((N, 1), device="cuda").long() - 1
     cluster_labels[is_fg] = torch.from_numpy(fg_labels).long().to("cuda").unsqueeze(-1)
@@ -87,7 +111,7 @@ def clusterer_bgremoved(filepath_npz: str, K:int=32, timestride:int=2, remove_bg
     for t in range(len(params['means3D'])):
         rendervar = {
             'means3D': params['means3D'][t],
-            'colors_precomp': colors,
+            'colors_precomp': colors[t], #NOTE: make work for different render modes 
             'rotations': rot[t],
             'opacities': torch.sigmoid(params['logit_opacities']),
             'scales': torch.exp(params['log_scales']),
