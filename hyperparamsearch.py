@@ -10,6 +10,8 @@ from external import build_rotation
 from colormap import colormap
 from copy import deepcopy
 from cluster import cluster, get_colors, plot_elbow_graph
+import itertools
+import os
 
 RENDER_MODE = 'color'  # 'color', 'depth' or 'centers'
 # RENDER_MODE = 'depth'  # 'color', 'depth' or 'centers'
@@ -173,13 +175,13 @@ def rgbd2pcd(im, depth, w2c, k, show_depth=False, project_to_cam_w_scale=None):
     cols = o3d.utility.Vector3dVector(cols.contiguous().double().cpu().numpy())
     return pts, cols
 
-def search(filepath, K:int=20):
-    for POS, DPOS, DROT in zip([1/100],[1],[1]):
+def search(filepath, K:int=26):
+    for POS, DPOS, DROT in itertools.product(range(1, 6), repeat=3):
         params = {
-            "timestride":1,
-            "POS":np.exp(POS-5),
-            "DPOS":1,
-            "DROT":1
+           "timestride": 3,
+           "POS": np.exp(POS - 5),
+           "DPOS": np.exp(DPOS - 5),
+           "DROT": np.exp(DROT - 5)
         }
         scene_data, _, _, cluster_centers  = cluster(filepath, **params)
 
@@ -255,6 +257,10 @@ def search(filepath, K:int=20):
         if not vis.poll_events():
             break
         vis.update_renderer()
+
+        output_folder = 'hpsearch'
+        if not os.path.exists(output_folder):
+            os.makedirs(output_folder)
 
         vis.capture_screen_image(F"hpsearch/POS={POS}_DPOS={DPOS}_DROT={DROT}.png")
 
