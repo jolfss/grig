@@ -178,10 +178,10 @@ def rgbd2pcd(im, depth, w2c, k, show_depth=False, project_to_cam_w_scale=None):
 def search(filepath, K:int=26):
     for POS, DPOS, DROT in itertools.product(range(1, 6), repeat=3):
         params = {
-           "timestride": 3,
-           "POS": np.exp(POS - 5),
-           "DPOS": np.exp(DPOS - 5),
-           "DROT": np.exp(DROT - 5)
+           "timestride": 5,
+           "POS": np.exp(POS - 3),
+           "DPOS": np.exp(DPOS - 3),
+           "DROT": np.exp(DROT - 3)
         }
         scene_data, _, _, cluster_centers  = cluster(filepath, **params)
 

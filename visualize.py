@@ -10,6 +10,7 @@ from external import build_rotation
 from colormap import colormap
 from copy import deepcopy
 from cluster import cluster, get_colors, plot_elbow_graph
+from grig import grig_cluster, Config
 
 RENDER_MODE = 'color'  # 'color', 'depth' or 'centers'
 # RENDER_MODE = 'depth'  # 'color', 'depth' or 'centers'
@@ -281,8 +282,9 @@ def sean_visualize(filepath, use_elbow:Optional[int]=None):
         "DROT":1,
         "K":K,
         "remove_bg":False,
+        "normalize_features":True
     }
-    scene_data, _, _, cluster_centers  = cluster(filepath, **params)
+    scene_data, _, _, cluster_centers  = grig_cluster(filepath, Config(**params))
 
     vis = o3d.visualization.Visualizer()
     vis.create_window(width=int(w * view_scale), height=int(h * view_scale), visible=True)
@@ -378,8 +380,9 @@ def sean_visualize(filepath, use_elbow:Optional[int]=None):
     del vis
     del render_options
 
+import sys
 if __name__ == "__main__":
     # exp_name = "pretrained"
     # for sequence in ["juggle", "softball", "tennis"]:
     #     visualize(sequence, exp_name)
-    sean_visualize("./output/pretrained/softball/params.npz", 26)
+    sean_visualize(F"./output/pretrained/{sys.argv[1]}/params.npz", 20)

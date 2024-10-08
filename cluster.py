@@ -19,7 +19,7 @@ default_params = {
 
 #NOTE modified from [load_scene_data] in visualize.py 
 @torch.no_grad()
-def cluster(filepath_npz, K:int=26, timestride:int=1, POS:float=1.0, DPOS:float=1.0, DROT:float=1.0, remove_bg:bool=True, normalize_features:bool=False) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
+def cluster(filepath_npz, K:int=26, timestride:int=1, POS:float=1.0, DPOS:float=1.0, DROT:float=1.0, remove_bg:bool=True, normalize_features:bool=True) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Requires (from .npz)
         means3D (x,y,z) --note y is vertical
@@ -28,7 +28,7 @@ def cluster(filepath_npz, K:int=26, timestride:int=1, POS:float=1.0, DPOS:float=
         rgb_colors (-inf,inf) but [0,1] intended range (<0 black, 1 is peak intensity, >1 limits to solid ellipse of peak intensity)
         logit_opacities (0,inf)
     Returns
-        features: (N, T*10) Tensor@cuda [x, y, z, dxdt, dydt, dzdt, dqxdt, dqydt, dqzdt, dqwdt]
+        features: (N, T*10) Tensor@cuda [x, y, z, dxdt, dydt, dzdt, dqxdt, dqydt, dqzdt, dqwdt]:w
         scene_data: Dict[str,Tensor@cuda]
     """
     print(F"[grig]: Opening {filepath_npz}")
@@ -76,7 +76,8 @@ def cluster(filepath_npz, K:int=26, timestride:int=1, POS:float=1.0, DPOS:float=
     print(F"[grig]: Preprocessing Foreground Features")
     scaler = StandardScaler()
     fg_features = fg_features.cpu().numpy()
-    fg_features = scaler.fit_transform(fg_features)
+    if normalize_features:
+        fg_features = scaler.fit_transform(fg_features)
 
     # cluster
     print(F"[grig]: Clustering Foreground Gaussians")
@@ -84,17 +85,21 @@ def cluster(filepath_npz, K:int=26, timestride:int=1, POS:float=1.0, DPOS:float=
     kmeans.fit(fg_features)
     fg_labels = kmeans.labels_
 
-    #COLOR MODES
+    # color modes
     cmap = cm.get_cmap('turbo', K)
     #CLUSTER COLORS
     cluster_colors = cmap(fg_labels)[:, :3]  
     feature_colors = torch.from_numpy(cluster_colors).float().to("cuda").expand((150,-1,3))
-    #ROTATION COLORS
-    #feature_colors = rot[:,:,:3][:,is_fg] #(T,N[is_fg],3)
+    #DROTATION COLORS
+    #feature_colors = drot_dt[:,:,:3][:,is_fg] #(T,N[is_fg],3)
+    #DPOSITION COLORS
+    #feature_colors = torch.abs(dpos_dt)[:,:,:3][:,is_fg] #(T,N[is_fg],3)
+    #POSITION COLORS
+    # feature_colors = torch.abs(pos)[:,:,:3][:,is_fg] #(T,N[is_fg],3)
 
 
-    colors = params["rgb_colors"] #NOTE: color is constant w.r.t. time 
-    colors[:,is_fg] = feature_colors #NOTE: Should be a FPS correction
+    colors = params["rgb_colors"]       #NOTE: color is constant w.r.t. time 
+    colors[:,is_fg] = feature_colors    
 
     cluster_labels = torch.zeros((N, 1), device="cuda").long() - 1
     cluster_labels[is_fg] = torch.from_numpy(fg_labels).long().to("cuda").unsqueeze(-1)
@@ -111,7 +116,7 @@ def cluster(filepath_npz, K:int=26, timestride:int=1, POS:float=1.0, DPOS:float=
     for t in range(len(params['means3D'])):
         rendervar = {
             'means3D': params['means3D'][t],
-            'colors_precomp': colors[t], #NOTE: make work for different render modes 
+            'colors_precomp': colors[t], 
             'rotations': rot[t],
             'opacities': torch.sigmoid(params['logit_opacities']),
             'scales': torch.exp(params['log_scales']),
