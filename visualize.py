@@ -10,7 +10,7 @@ from external import build_rotation
 from colormap import colormap
 from copy import deepcopy
 from cluster import cluster, get_colors, plot_elbow_graph
-from grig import grig_cluster, Config
+from grig import *
 
 RENDER_MODE = 'color'  # 'color', 'depth' or 'centers'
 # RENDER_MODE = 'depth'  # 'color', 'depth' or 'centers'
@@ -270,7 +270,7 @@ def visualize(seq, exp):
     del render_options
 
 
-def sean_visualize(filepath, use_elbow:Optional[int]=None):
+def sean_visualize(filepath, use_elbow:Optional[int]=None, color_mode:str="CLUSTERS"):
     # Default number of clusters if elbow is not used
     K = use_elbow if use_elbow \
         else plot_elbow_graph(filepath, max_clusters=15, stride=2) 
@@ -281,10 +281,13 @@ def sean_visualize(filepath, use_elbow:Optional[int]=None):
         "DPOS":1,
         "DROT":1,
         "K":K,
-        "remove_bg":False,
-        "normalize_features":True
+        "remove_bg":True,
+        "normalize_features":True,
+        "color_mode":color_mode
     }
-    scene_data, _, _, cluster_centers  = grig_cluster(filepath, Config(**params))
+
+    config = Config(**params)
+    scene_data, _, _, cluster_centers  = cluster(filepath, config)
 
     vis = o3d.visualization.Visualizer()
     vis.create_window(width=int(w * view_scale), height=int(h * view_scale), visible=True)
@@ -322,7 +325,6 @@ def sean_visualize(filepath, use_elbow:Optional[int]=None):
     render_options = vis.get_render_option()
     render_options.point_size = view_scale
     render_options.light_on = False
-
     start_time = time.time()
     num_timesteps = len(scene_data)
     while True:
@@ -385,4 +387,4 @@ if __name__ == "__main__":
     # exp_name = "pretrained"
     # for sequence in ["juggle", "softball", "tennis"]:
     #     visualize(sequence, exp_name)
-    sean_visualize(F"./output/pretrained/{sys.argv[1]}/params.npz", 20)
+    sean_visualize(F"./output/pretrained/{sys.argv[1]}/params.npz", 20, sys.argv[2])
