@@ -17,25 +17,6 @@ from typing import Dict, Tuple
 #-----------#
 #   types   #
 #-----------#
-@dataclass
-class GrigConfig:
-    K:int
-    "The number of means to cluster over."
-    timestride:int
-    "How many time frames should be skipped over."
-    POS:float
-    "The weighting of the `POS` feature."
-    DPOS:float
-    "The weighting of the `DPOS` feature."
-    DROT:float
-    "The weighting of the `DROT` feature."
-    remove_bg:bool
-    "Whether to render the background gaussians (with their default rbg colors)."
-    normalize_features:bool
-    "Whether each feature component should be normalized.."
-    color_mode:str
-    """Which color mode to use for rendering.
-    Options: CLUSTER POS DPOS ROT DROT"""
 
 @dataclass
 class Parameters:
@@ -44,25 +25,59 @@ class Parameters:
         `T`: timestep
         `N`: gaussians
     """
+
     means3D:torch.Tensor
     """The centers (x,y,z) of the gaussians; y is vertical.\n
     `(T,N,3)@cuda float`"""
+
     unnorm_rotations : torch.Tensor 
     """The unnormalized quaternions (qx,qy,qz,qw)? representation of the gaussians' rotations.
     `(T,N,4)@cuda float`"""
+
     log_scales : torch.Tensor 
     """The log scales/multivariances of the gaussians (sx, sy, sz)?\n
     `(N,3)@cuda float`"""
+
     rgb_colors : torch.Tensor 
     """The colors of the gaussians; (-inf,inf) but intended range [0,1].\n
     (<0 black, 1 is peak intensity, >1 limits to solid ellipse of peak intensity)\n
     `(N,3)@cuda float`"""
+
     seg_colors : torch.Tensor
     """The segmentation color of the gaussians; used to segment foreground and background natively.
     `(N,3)@cuda float`"""
+    
     logit_opacities : torch.Tensor
     """The logits representing the opacities of the gaussians.\n
     `(N)@cuda float`""" 
+
+@dataclass
+class GrigConfig:
+    K:int
+    "The number of means to cluster over."
+
+    timestride:int
+    "How many time frames should be skipped over."
+
+    POS:float
+    "The weighting of the `POS` feature."
+
+    DPOS:float
+    "The weighting of the `DPOS` feature."
+
+    DROT:float
+    "The weighting of the `DROT` feature."
+
+    remove_bg:bool
+    "Whether to render the background gaussians (with their default rbg colors)."
+
+    normalize_features:bool
+    "Whether each feature component should be normalized.."
+
+    color_mode:str
+    """Which color mode to use for rendering.
+    Options: CLUSTER POS DPOS ROT DROT"""
+
 
 class Features:
     """
@@ -70,11 +85,11 @@ class Features:
     """
     features : torch.Tensor
     """The output of some function on the input parameters.\n
-    `(N, D*T//config.timestride)@cuda float`"""
+    `(N,D*T//config.timestride)@cuda float`"""
     
     is_fg : torch.Tensor
     """A boolean mask along gaussians specifying which are foreground and background.\n
-    `(N, )@cuda bool`"""
+    `(N,)@cuda bool`"""
     
     pos : torch.Tensor
     """The centers of the gaussians (x,y,z).
@@ -82,7 +97,7 @@ class Features:
     
     rot : torch.Tensor
     """The orientations of the gaussians as normalized quaternions (qx,qy,qz,qw)\n
-    NOTE: Have not fully considered the implications of the double cover of `SO(3)`.\n
+    TODO: Have not fully considered the implications of the double cover of `SO(3)`.\n
     `(T,N,4)@cuda float`"""
 
     dpos_dt : torch.Tensor
@@ -145,6 +160,7 @@ class Features:
         """Forward item deletion."""
         del self.features[key]
 
+
 #----------------------#
 #   global constants   #
 #----------------------#
@@ -183,6 +199,7 @@ def cluster(filepath_npz:str, config:GrigConfig) -> Tuple[Dict[str, torch.Tensor
 
     print("Preparing Foreground Features")
     features = Features(params, config)
+
     fg_features = features[features.is_fg]
     fg_features = fg_features.cpu().numpy()
 
@@ -211,7 +228,7 @@ def cluster(filepath_npz:str, config:GrigConfig) -> Tuple[Dict[str, torch.Tensor
     else: #RGB
         pass
 
-    colors = params.rgb_colors    #NOTE: color is constant w.r.t. time
+    colors = params.rgb_colors #NOTE: color is constant w.r.t. time
     if feature_colors is not None:
         colors[:,features.is_fg] = feature_colors 
 
