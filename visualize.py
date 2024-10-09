@@ -9,8 +9,6 @@ from helpers import setup_camera, quat_mult
 from external import build_rotation
 from colormap import colormap
 from copy import deepcopy
-from cluster import cluster, get_colors, plot_elbow_graph
-from grig import *
 
 RENDER_MODE = 'color'  # 'color', 'depth' or 'centers'
 # RENDER_MODE = 'depth'  # 'color', 'depth' or 'centers'
@@ -46,10 +44,7 @@ def init_camera(y_angle=0., center_dist=2.4, cam_height=1.3, f_ratio=0.82):
     k = np.array([[f_ratio * w, 0, w / 2], [0, f_ratio * w, h / 2], [0, 0, 1]])
     return w2c, k
 
-#---------------------------------#
-#   NOTE: Original source code.   #
-#---------------------------------#
-def __load_scene_data(seq, exp, seg_as_col=False):
+def load_scene_data(seq, exp, seg_as_col=False):
     params = dict(np.load(f"./output/{exp}/{seq}/params.npz"))
     params = {k: torch.tensor(v).cuda().float() for k, v in params.items()}
     is_fg = params['seg_colors'][:, 0] > 0.5
@@ -58,40 +53,6 @@ def __load_scene_data(seq, exp, seg_as_col=False):
         rendervar = {
             'means3D': params['means3D'][t],
             'colors_precomp': params['rgb_colors'][t] if not seg_as_col else params['seg_colors'],
-            'rotations': torch.nn.functional.normalize(params['unnorm_rotations'][t]),
-            'opacities': torch.sigmoid(params['logit_opacities']),
-            'scales': torch.exp(params['log_scales']),
-            'means2D': torch.zeros_like(params['means3D'][0], device="cuda")
-        }
-        if REMOVE_BACKGROUND:
-            rendervar = {k: v[is_fg] for k, v in rendervar.items()}
-        scene_data.append(rendervar)
-    if REMOVE_BACKGROUND:
-        is_fg = is_fg[is_fg]
-    return scene_data, is_fg
-
-#---------------------------------#
-#   NOTE: Custom-color testing.   #
-#---------------------------------#
-def load_scene_data(seq, exp, seg_as_col=False, use_elbow=True):
-    params = dict(np.load(f"./output/{exp}/{seq}/params.npz"))
-    params = {k: torch.tensor(v).cuda().float() for k, v in params.items()}
-
-    is_fg = params['seg_colors'][:, 0] > 0.5
-    scene_data = []
-    
-    optimal_k = 10 # User has to specify this if use_elbow is False
-
-    # Pass the elbow flag here
-    if use_elbow:
-        optimal_k = plot_elbow_graph(seq, exp, max_clusters=30, stride = 3)
-
-    colors = get_colors(seq, exp, num_clusters=optimal_k)
-
-    for t in range(len(params['means3D'])):
-        rendervar = {
-            'means3D': params['means3D'][t],
-            'colors_precomp': colors,
             'rotations': torch.nn.functional.normalize(params['unnorm_rotations'][t]),
             'opacities': torch.sigmoid(params['logit_opacities']),
             'scales': torch.exp(params['log_scales']),
@@ -269,122 +230,7 @@ def visualize(seq, exp):
     del vis
     del render_options
 
-
-def sean_visualize(filepath, use_elbow:Optional[int]=None, color_mode:str="CLUSTERS"):
-    # Default number of clusters if elbow is not used
-    K = use_elbow if use_elbow \
-        else plot_elbow_graph(filepath, max_clusters=15, stride=2) 
-
-    params = {
-        "timestride":1,
-        "POS":1,
-        "DPOS":1,
-        "DROT":1,
-        "K":K,
-        "remove_bg":True,
-        "normalize_features":True,
-        "color_mode":color_mode
-    }
-
-    config = Config(**params)
-    scene_data, _, _, cluster_centers  = cluster(filepath, config)
-
-    vis = o3d.visualization.Visualizer()
-    vis.create_window(width=int(w * view_scale), height=int(h * view_scale), visible=True)
-
-    w2c, k = init_camera()
-    im, depth = render(w2c, k, scene_data[0])
-    init_pts, init_cols = rgbd2pcd(im, depth, w2c, k, show_depth=(RENDER_MODE == 'depth'))
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = init_pts
-    pcd.colors = init_cols
-    vis.add_geometry(pcd)
-    
-    #---------------------EDITS
-    # Initialize the sphere list and store the sphere geometries
-    spheres = []
-
-    # Create spheres for all cluster centers
-    for _ in range(K):
-        sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.005)  # Adjust the radius as needed
-        sphere.paint_uniform_color([1, 1, 1])  # Color the sphere red
-        spheres.append(sphere)
-        vis.add_geometry(sphere)
-    #--------------------------
-
-    view_k = k * view_scale
-    view_k[2, 2] = 1
-    view_control = vis.get_view_control()
-    cparams = o3d.camera.PinholeCameraParameters()
-    cparams.extrinsic = w2c
-    cparams.intrinsic.intrinsic_matrix = view_k
-    cparams.intrinsic.height = int(h * view_scale)
-    cparams.intrinsic.width = int(w * view_scale)
-    view_control.convert_from_pinhole_camera_parameters(cparams, allow_arbitrary=True)
-
-    render_options = vis.get_render_option()
-    render_options.point_size = view_scale
-    render_options.light_on = False
-    start_time = time.time()
-    num_timesteps = len(scene_data)
-    while True:
-        passed_time = time.time() - start_time
-        passed_frames = passed_time * fps
-        t = int(passed_frames % num_timesteps)
-
-        if FORCE_LOOP:
-            num_loops = 1.4
-            y_angle = 360*t*num_loops / num_timesteps
-            w2c, k = init_camera(y_angle)
-            cam_params = view_control.convert_to_pinhole_camera_parameters()
-            cam_params.extrinsic = w2c
-            view_control.convert_from_pinhole_camera_parameters(cam_params, allow_arbitrary=True)
-        else:  # Interactive control
-            cam_params = view_control.convert_to_pinhole_camera_parameters()
-            view_k = cam_params.intrinsic.intrinsic_matrix
-            k = view_k / view_scale
-            k[2, 2] = 1
-            w2c = cam_params.extrinsic
-
-        # Render Gaussian Splat
-        im, depth = render(w2c, k, scene_data[t])
-        pts, cols = rgbd2pcd(im, depth, w2c, k, show_depth=(RENDER_MODE == 'depth'))
-        pcd.points = pts  
-        pcd.colors = cols
-        vis.update_geometry(pcd)
-
-        #-------------------------#
-        #  centers visualization  #
-        #-------------------------#
-        centers = torch.cat([cluster_centers[t],torch.ones((K,1))],dim=-1) # (K,4)
-        centers = centers.numpy() @ w2c.T
-        centers[:,:3] *= 0.25
-        centers = centers @ np.linalg.inv(w2c).T
-        
-        # Update the position of each sphere based on the camera coordinates
-        for c in range(K):
-            spheres[c].translate(centers[c,:3], relative=False)
-
-            # Update each sphere individually in the visualizer
-            vis.update_geometry(spheres[c])
-
-        # NOTE: The below code is the world->pixel transformation; but o3d does not support plotting
-        # at (x,y) locations. We instead need to fudge it by projecting to a small z-depth as done above.
-        # homogenous_centers_image = homogenous_centers_camera[:3,:3] @ k.T
-        # centers_projected = homogenous_centers_image[:,:2] / homogenous_centers_image[:,2:]
-
-        if not vis.poll_events():
-            break
-        vis.update_renderer()
-
-    vis.destroy_window()
-    del view_control
-    del vis
-    del render_options
-
-import sys
 if __name__ == "__main__":
-    # exp_name = "pretrained"
-    # for sequence in ["juggle", "softball", "tennis"]:
-    #     visualize(sequence, exp_name)
-    sean_visualize(F"./output/pretrained/{sys.argv[1]}/params.npz", 20, sys.argv[2])
+    exp_name = "pretrained"
+    for sequence in ["juggle", "softball", "tennis"]:
+        visualize(sequence, exp_name)

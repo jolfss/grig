@@ -4,11 +4,11 @@
 import time
 import open3d as o3d
 from visualize import init_camera, render, rgbd2pcd 
-
-#
-from dataclasses import dataclass
 import torch
 import numpy as np
+
+# our imports
+from dataclasses import dataclass
 import matplotlib.cm as cm
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
