@@ -186,7 +186,7 @@ default_config = GrigConfig(
 #   methods   #
 #-------------#
 @torch.no_grad()
-def cluster(filepath_npz:str, config:GrigConfig) -> Tuple[Dict[str, torch.Tensor], Features, torch.Tensor, torch.Tensor]:
+def grig(filepath_npz:str, config:GrigConfig) -> Tuple[Dict[str, torch.Tensor], Features, torch.Tensor, torch.Tensor]:
     """
     The clustering algorithm `(param_filepath, config) -> (scene_data, features, labels, centers)`. 
     """
@@ -259,7 +259,7 @@ def cluster(filepath_npz:str, config:GrigConfig) -> Tuple[Dict[str, torch.Tensor
     return scene_data, features, cluster_labels, cluster_centers
     
 def visualize(filepath_npz:str, config:GrigConfig):
-    scene_data, _, _, cluster_centers  = cluster(filepath_npz, config)
+    scene_data, _, _, cluster_centers  = grig(filepath_npz, config)
 
     vis = o3d.visualization.Visualizer()
     vis.create_window(width=int(w * view_scale), height=int(h * view_scale), visible=True)
