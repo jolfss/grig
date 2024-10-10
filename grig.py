@@ -12,154 +12,12 @@ from dataclasses import dataclass
 import matplotlib.cm as cm
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Union
 
-#-----------#
-#   types   #
-#-----------#
-
-@dataclass
-class Parameters:
-    """
-    The inputs necessary to visualize a Dynamic 3D Gaussian.
-        `T`: timestep
-        `N`: gaussians
-    """
-
-    means3D:torch.Tensor
-    """The centers (x,y,z) of the gaussians; y is vertical.\n
-    `(T,N,3)@cuda float`"""
-
-    unnorm_rotations : torch.Tensor 
-    """The unnormalized quaternions (qx,qy,qz,qw)? representation of the gaussians' rotations.
-    `(T,N,4)@cuda float`"""
-
-    log_scales : torch.Tensor 
-    """The log scales/multivariances of the gaussians (sx, sy, sz)?\n
-    `(N,3)@cuda float`"""
-
-    rgb_colors : torch.Tensor 
-    """The colors of the gaussians; (-inf,inf) but intended range [0,1].\n
-    (<0 black, 1 is peak intensity, >1 limits to solid ellipse of peak intensity)\n
-    `(N,3)@cuda float`"""
-
-    seg_colors : torch.Tensor
-    """The segmentation color of the gaussians; used to segment foreground and background natively.
-    `(N,3)@cuda float`"""
-    
-    logit_opacities : torch.Tensor
-    """The logits representing the opacities of the gaussians.\n
-    `(N)@cuda float`""" 
-
-@dataclass
-class GrigConfig:
-    K:int
-    "The number of means to cluster over."
-
-    timestride:int
-    "How many time frames should be skipped over."
-
-    POS:float
-    "The weighting of the `POS` feature."
-
-    DPOS:float
-    "The weighting of the `DPOS` feature."
-
-    DROT:float
-    "The weighting of the `DROT` feature."
-
-    remove_bg:bool
-    "Whether to render the background gaussians (with their default rbg colors)."
-
-    normalize_features:bool
-    "Whether each feature component should be normalized.."
-
-    color_mode:str
-    """Which color mode to use for rendering.
-    Options: CLUSTER POS DPOS ROT DROT"""
-
-
-class Features:
-    """
-    Representation of the features extracted from the parameter file.
-    """
-    features : torch.Tensor
-    """The output of some function on the input parameters.\n
-    `(N,D*T//config.timestride)@cuda float`"""
-    
-    is_fg : torch.Tensor
-    """A boolean mask along gaussians specifying which are foreground and background.\n
-    `(N,)@cuda bool`"""
-    
-    pos : torch.Tensor
-    """The centers of the gaussians (x,y,z).
-    `(T,N,3)@cuda float`"""
-    
-    rot : torch.Tensor
-    """The orientations of the gaussians as normalized quaternions (qx,qy,qz,qw)\n
-    TODO: Have not fully considered the implications of the double cover of `SO(3)`.\n
-    `(T,N,4)@cuda float`"""
-
-    dpos_dt : torch.Tensor
-    """The time derivative `(/s)` of `pos`.\n
-    `(T,N,3)@cuda float`"""
-    
-    drot_dt : torch.Tensor
-    """The time derivative `(/s)` of `rot`.\n
-    `(T,N,4)@cuda float`"""
-    
-    T : int
-    "The number of timesteps."
-    N : int
-    "The number of gaussians."
-    D : int
-    "The size of the feature dimension (at each timestep)."
-
-    def __init__(self, params : Parameters, config : GrigConfig):
-        # initialize  
-        self.pos = params.means3D
-        self.rot = torch.nn.functional.normalize(params.unnorm_rotations, dim=-1)
-        self.dpos_dt = torch.gradient(self.pos, spacing=30*config.timestride, dim=0)[0] # NOTE: Spacing is adjustment for 30fps input
-        self.drot_dt = torch.gradient(self.rot, spacing=30*config.timestride, dim=0)[0] 
-
-        # size checks
-        T_pos, N_pos, D_pos = self.pos.size()
-        T_posdt, N_posdt, D_posdt = self.dpos_dt.size()
-        T_rot, N_rot, D_rot = self.rot.size()
-        T_rotdt, N_rotdt, D_rotdt = self.drot_dt.size()
-        assert T_pos == T_posdt == T_rot == T_rotdt >= 2
-        assert N_pos == N_posdt == N_rot == N_rotdt >= 2
-        assert D_pos == D_posdt == 3
-        assert D_rot == D_rotdt == 4
-        self.N = N_pos
-        self.T = T_pos
-        self.D = self.pos.size(-1) + self.dpos_dt.size(-1) + self.drot_dt.size(-1) # TODO: adjust for feature ablation/mod/aug
-
-        # prepare raw feature vector 
-        self.features = torch.cat((
-            config.POS*self.pos[::config.timestride], 
-            config.DPOS*self.dpos_dt[::config.timestride], 
-            config.DROT*self.drot_dt[::config.timestride]), dim=-1).permute(1, 0, 2).reshape((self.N, -1))  # -1 = feature_dim*T//timestride
-
-        # foreground mask
-        self.is_fg=params.seg_colors[:,0] > 0.5,
-
-    def __getattr__(self, name):
-        """Called when the requested attribute or method isn't found in the object."""
-        return getattr(self.features, name)
-    
-    def __getitem__(self, key):
-        """Forward item access (slicing or indexing)."""
-        return self.features[key]
-    
-    def __setitem__(self, key, value):
-        """Forward item assignment."""
-        self.features[key] = value
-    
-    def __delitem__(self, key):
-        """Forward item deletion."""
-        del self.features[key]
-
+# types
+from parameters import Parameters
+from config import Config, BaseConfig, KMeansConfig
+from features import Features
 
 #----------------------#
 #   global constants   #
@@ -170,23 +28,12 @@ near, far = 0.01, 100.0
 view_scale = 3.9
 fps = 20
 
-# clustering config
-default_config = GrigConfig(
-    timestride=1,
-    POS=1,
-    DPOS=1,
-    DROT=1,
-    K=24,
-    remove_bg=True,
-    normalize_features=True,
-    color_mode="CLUSTERS"
-)
 
 #-------------#
 #   methods   #
 #-------------#
 @torch.no_grad()
-def grig(filepath_npz:str, config:GrigConfig) -> Tuple[Dict[str, torch.Tensor], Features, torch.Tensor, torch.Tensor]:
+def grig(filepath_npz:str, config:Config) -> Tuple[Dict[str, torch.Tensor], Features, torch.Tensor, torch.Tensor]:
     """
     The clustering algorithm `(param_filepath, config) -> (scene_data, features, labels, centers)`. 
     """
@@ -258,7 +105,7 @@ def grig(filepath_npz:str, config:GrigConfig) -> Tuple[Dict[str, torch.Tensor], 
 
     return scene_data, features, cluster_labels, cluster_centers
     
-def visualize(filepath_npz:str, config:GrigConfig):
+def visualize(filepath_npz:str, config:Config):
     scene_data, _, _, cluster_centers  = grig(filepath_npz, config)
 
     vis = o3d.visualization.Visualizer()
@@ -336,5 +183,14 @@ def visualize(filepath_npz:str, config:GrigConfig):
 
 import sys
 if __name__ == "__main__":
-    default_config.color_mode = sys.argv[2]
-    visualize(F"./output/pretrained/{sys.argv[1]}/params.npz", default_config)
+    config = KMeansConfig(
+        timestride=1,
+        POS=1,
+        DPOS=1,
+        DROT=1,
+        K=24,
+        remove_bg=True,
+        normalize_features=True,
+        color_mode=sys.argv[2]
+    )
+    visualize(F"./output/pretrained/{sys.argv[1]}/params.npz", config)
