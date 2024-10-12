@@ -18,6 +18,7 @@ from typing import Dict, Tuple, Union
 from parameters import Parameters
 from config import Config, BaseConfig, KMeansConfig
 from features import Features
+from clustering import Clustering
 
 #----------------------#
 #   global constants   #
@@ -33,9 +34,9 @@ fps = 20
 #   methods   #
 #-------------#
 @torch.no_grad()
-def grig(filepath_npz:str, config:Config) -> Tuple[Dict[str, torch.Tensor], Features, torch.Tensor, torch.Tensor]:
+def grig(filepath_npz:str, config:Config) -> Tuple[Dict[str, torch.Tensor],Clustering]:
     """
-    The clustering algorithm `(param_filepath, config) -> (scene_data, features, labels, centers)`. 
+    The clustering algorithm `(param_filepath, config) -> (scene_data, features, labels, label_masks, centers)`. 
     """
     
     print(F"Opening {filepath_npz}")
@@ -46,7 +47,6 @@ def grig(filepath_npz:str, config:Config) -> Tuple[Dict[str, torch.Tensor], Feat
 
     print("Preparing Foreground Features")
     features = Features(params, config)
-
     fg_features = features[features.is_fg]
     fg_features = fg_features.cpu().numpy()
 
@@ -60,6 +60,22 @@ def grig(filepath_npz:str, config:Config) -> Tuple[Dict[str, torch.Tensor], Feat
     kmeans.fit(fg_features)
     fg_labels = kmeans.labels_
 
+    clustering = Clustering(
+        config.K, 
+        features, 
+        torch.from_numpy(fg_labels).long().to("cuda")
+    )
+
+    # print(F"Calculating Centers")
+    # cluster_labels = torch.zeros((features.N, 1), device="cuda").long() - 1
+    # cluster_labels[features.is_fg] = torch.from_numpy(fg_labels).long().to("cuda").unsqueeze(-1)
+    # cluster_centers = torch.zeros((features.T, config.K, 3))  # T time steps, K clusters, 3 dimensions for position
+    # cluster_label_masks = [] 
+    # for c in range(config.K):
+    #     mask = (cluster_labels==c)
+    #     cluster_label_masks.append(mask)
+    #     cluster_centers[:, c, :] = (features.pos * mask).sum(dim=1) / mask.sum() # NOTE: Assumes no empty clusters
+    
     print(F"Coloring Gaussians (Mode={config.color_mode})")
     cmap = cm.get_cmap('turbo', config.K)
     feature_colors = None
@@ -79,15 +95,6 @@ def grig(filepath_npz:str, config:Config) -> Tuple[Dict[str, torch.Tensor], Feat
     if feature_colors is not None:
         colors[:,features.is_fg] = feature_colors 
 
-    print(F"Calculating Centers")
-    cluster_labels = torch.zeros((features.N, 1), device="cuda").long() - 1
-    cluster_labels[features.is_fg] = torch.from_numpy(fg_labels).long().to("cuda").unsqueeze(-1)
-    cluster_centers = torch.zeros((features.T, config.K, 3))  # T time steps, K clusters, 3 dimensions for position
-    
-    for c in range(config.K):
-        mask = (cluster_labels==c)
-        cluster_centers[:, c, :] = (features.pos * mask).sum(dim=1) / mask.sum() # NOTE: Assumes no empty clusters
-    
     print(F"Preparing Rendervars")
     scene_data = []
     for t in range(len(features.pos)):
@@ -103,14 +110,20 @@ def grig(filepath_npz:str, config:Config) -> Tuple[Dict[str, torch.Tensor], Feat
             rendervar = {k: v[features.is_fg] for k, v in rendervar.items()}  
         scene_data.append(rendervar)
 
-    return scene_data, features, cluster_labels, cluster_centers
-    
+    return scene_data, clustering
+
+
 def visualize(filepath_npz:str, config:Config):
-    scene_data, _, _, cluster_centers  = grig(filepath_npz, config)
+    scene_data, clustering  = grig(filepath_npz, config)
 
     vis = o3d.visualization.Visualizer()
     vis.create_window(width=int(w * view_scale), height=int(h * view_scale), visible=True)
 
+    #-------------------------#
+    #   initialize geometry   #
+    #-------------------------#
+
+    ## gaussian splat
     w2c, k = init_camera()
     im, depth = render(w2c, k, scene_data[0])
     init_pts, init_cols = rgbd2pcd(im, depth, w2c, k, show_depth=False)
@@ -118,14 +131,35 @@ def visualize(filepath_npz:str, config:Config):
     pcd.points = init_pts
     pcd.colors = init_cols
     vis.add_geometry(pcd)
-    
+
+    ## cluster center dots
     cluster_center_dots = []
-    for _ in range(config.K):
-        center = o3d.geometry.TriangleMesh.create_sphere(radius=0.005)  # Adjust the radius as needed
-        center.paint_uniform_color([1, 1, 1])  # Color the sphere red
+    for _ in range(clustering.num_clusters):
+        center = o3d.geometry.TriangleMesh.create_sphere(radius=0.005) 
+        center.paint_uniform_color([1, 1, 1])   
         cluster_center_dots.append(center)
         vis.add_geometry(center)
 
+    ## transformation lines
+    lineset = o3d.geometry.LineSet()
+    cluster_center_xform_points = np.zeros((4*config.K,3)) # 4 points (center,->x,->y,->z) for each cluster
+    cluster_center_xform_lines = np.zeros((3*config.K, 2)) # connect center to each
+    cluster_center_xform_colors = np.zeros((3*config.K,3)) # r,g,b axis colorings
+    for c in range(config.K):
+        cluster_center_xform_lines[3*c]   = [4*c, 4*c+1]
+        cluster_center_xform_lines[3*c+1] = [4*c, 4*c+2]
+        cluster_center_xform_lines[3*c+2] = [4*c, 4*c+3]
+        cluster_center_xform_colors[3*c  ]  = [1,0,0]
+        cluster_center_xform_colors[3*c+1]  = [0,1,0]
+        cluster_center_xform_colors[3*c+2]  = [0,0,1]
+    lineset.points = o3d.utility.Vector3dVector(cluster_center_xform_points)
+    lineset.lines = o3d.utility.Vector2iVector(cluster_center_xform_lines)
+    lineset.colors = o3d.utility.Vector3dVector(cluster_center_xform_colors)
+    vis.add_geometry(lineset)
+
+    #----------------------#
+    #   set up viewpoint   #
+    #----------------------#
     view_k = k * view_scale
     view_k[2, 2] = 1
     view_control = vis.get_view_control()
@@ -141,36 +175,42 @@ def visualize(filepath_npz:str, config:Config):
     render_options.light_on = False
     start_time = time.time()
     num_timesteps = len(scene_data)
+
+    #-----------------#
+    #   render loop   #
+    #-----------------#
     while True:
+        ## time tracking
         passed_time = time.time() - start_time
         passed_frames = passed_time * fps
         t = int(passed_frames % num_timesteps)
 
+        ## update camera
         cam_params = view_control.convert_to_pinhole_camera_parameters()
         view_k = cam_params.intrinsic.intrinsic_matrix
         k = view_k / view_scale
         k[2, 2] = 1
         w2c = cam_params.extrinsic
 
-        # render gaussian splat
+        # update gaussian splat
         im, depth = render(w2c, k, scene_data[t])
         pts, cols = rgbd2pcd(im, depth, w2c, k, show_depth=False)
         pcd.points = pts  
         pcd.colors = cols
         vis.update_geometry(pcd)
 
-        #  centers visualization 
-        center_locations = torch.cat([cluster_centers[t],torch.ones((config.K,1))],dim=-1) # (K,4)
-        center_locations = center_locations.numpy() @ w2c.T
-        center_locations[:,:3] *= 0.25
-        center_locations = center_locations @ np.linalg.inv(w2c).T
+        ## update center dots visualization 
+        center_dot_positions = torch.cat([clustering.centers[t],torch.ones((clustering.num_clusters,1))],dim=-1) # (K,4)
+        center_dot_positions = center_dot_positions.numpy() @ w2c.T
+        center_dot_positions[:,:3] *= 0.25
+        center_dot_positions = center_dot_positions @ np.linalg.inv(w2c).T
         
-        # update the position of each sphere based on the camera coordinates
         for c in range(config.K):
-            cluster_center_dots[c].translate(center_locations[c,:3], relative=False)
-
-            # Update each sphere individually in the visualizer
+            cluster_center_dots[c].translate(center_dot_positions[c,:3], relative=False)
             vis.update_geometry(cluster_center_dots[c])
+
+        ## update transformation lines
+
 
         if not vis.poll_events():
             break
