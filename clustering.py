@@ -22,6 +22,9 @@ class Clustering:
     """The (x,y,z) centers for each of the clusters for each timestep.
     `(T,num_clusters,3)@cpu float`"""
 
+    transformations : torch.Tensor
+    """The transformations of each cluster represented as [x,y,z,qw,qx,qy,qz].
+    `(T,num_clusters,7)@cuda float`"""
 
     def __init__(self, num_clusters:int, features:Features, labels:torch.Tensor):
         """
@@ -35,8 +38,12 @@ class Clustering:
 
         self.masks = torch.zeros((num_clusters, features.N), device="cuda").long()
         self.centers = torch.zeros((features.T, num_clusters, 3), device="cpu")
+        self.transformations = torch.zeros((features.T,num_clusters,7))
         for c in range(num_clusters):
             mask = (self.labels==c)
             self.masks[c,:] = mask
-            self.centers[:,c,:] = (features.pos * mask.unsqueeze(-1)).sum(dim=1) / mask.sum() # NOTE: assumes no empty clusters
+            # NOTE: assumes no empty clusters
+            self.centers[:,c,:] = (features.pos * mask.unsqueeze(-1)).sum(dim=1) / mask.sum() 
+            self.transformations[:,c,:] = (torch.cat((features.pos,features.rot),dim=-1) * mask.unsqueeze(-1)).sum(dim=1) / mask.sum() 
+
         

@@ -19,7 +19,7 @@ class Features:
     `(T,N,3)@cuda float`"""
     
     rot : torch.Tensor
-    """The orientations of the gaussians as normalized quaternions (qx,qy,qz,qw)\n
+    """The orientations of the gaussians as normalized quaternions (qw,qx,qy,qz)\n
     TODO: Have not fully considered the implications of the double cover of `SO(3)`.\n
     `(T,N,4)@cuda float`"""
 
@@ -68,6 +68,12 @@ class Features:
 
         # foreground mask
         self.is_fg=params.seg_colors[:,0] > 0.5
+
+    def __add__(self, rhs):
+        return self.features + rhs
+
+    def __mul__(self, rhs):
+        return self.features * rhs
 
     def __getattr__(self, name):
         """Called when the requested attribute or method isn't found in the object."""
