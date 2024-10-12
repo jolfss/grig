@@ -67,7 +67,7 @@ class Features:
             config.DROT*self.drot_dt[::config.timestride]), dim=-1).permute(1, 0, 2).reshape((self.N, -1))  # -1 = feature_dim*T//timestride
 
         # foreground mask
-        self.is_fg=params.seg_colors[:,0] > 0.5,
+        self.is_fg=params.seg_colors[:,0] > 0.5
 
     def __getattr__(self, name):
         """Called when the requested attribute or method isn't found in the object."""

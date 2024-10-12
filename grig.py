@@ -119,12 +119,12 @@ def visualize(filepath_npz:str, config:Config):
     pcd.colors = init_cols
     vis.add_geometry(pcd)
     
-    cluster_centers = []
+    cluster_center_dots = []
     for _ in range(config.K):
-        cluster_center = o3d.geometry.TriangleMesh.create_sphere(radius=0.005)  # Adjust the radius as needed
-        cluster_center.paint_uniform_color([1, 1, 1])  # Color the sphere red
-        cluster_centers.append(cluster_center)
-        vis.add_geometry(cluster_center)
+        center = o3d.geometry.TriangleMesh.create_sphere(radius=0.005)  # Adjust the radius as needed
+        center.paint_uniform_color([1, 1, 1])  # Color the sphere red
+        cluster_center_dots.append(center)
+        vis.add_geometry(center)
 
     view_k = k * view_scale
     view_k[2, 2] = 1
@@ -160,17 +160,17 @@ def visualize(filepath_npz:str, config:Config):
         vis.update_geometry(pcd)
 
         #  centers visualization 
-        centers = torch.cat([cluster_centers[t],torch.ones((config.K,1))],dim=-1) # (K,4)
-        centers = centers.numpy() @ w2c.T
-        centers[:,:3] *= 0.25
-        centers = centers @ np.linalg.inv(w2c).T
+        center_locations = torch.cat([cluster_centers[t],torch.ones((config.K,1))],dim=-1) # (K,4)
+        center_locations = center_locations.numpy() @ w2c.T
+        center_locations[:,:3] *= 0.25
+        center_locations = center_locations @ np.linalg.inv(w2c).T
         
         # update the position of each sphere based on the camera coordinates
         for c in range(config.K):
-            cluster_centers[c].translate(centers[c,:3], relative=False)
+            cluster_center_dots[c].translate(center_locations[c,:3], relative=False)
 
             # Update each sphere individually in the visualizer
-            vis.update_geometry(cluster_centers[c])
+            vis.update_geometry(cluster_center_dots[c])
 
         if not vis.poll_events():
             break
@@ -184,7 +184,7 @@ def visualize(filepath_npz:str, config:Config):
 import sys
 if __name__ == "__main__":
     config = KMeansConfig(
-        timestride=1,
+        timestride=10,
         POS=1,
         DPOS=1,
         DROT=1,
