@@ -68,25 +68,3 @@ class Features:
 
         # foreground mask
         self.is_fg=params.seg_colors[:,0] > 0.5
-
-    def __add__(self, rhs):
-        return self.features + rhs
-
-    def __mul__(self, rhs):
-        return self.features * rhs
-
-    def __getattr__(self, name):
-        """Called when the requested attribute or method isn't found in the object."""
-        return getattr(self.features, name)
-    
-    def __getitem__(self, key):
-        """Forward item access (slicing or indexing)."""
-        return self.features[key]
-    
-    def __setitem__(self, key, value):
-        """Forward item assignment."""
-        self.features[key] = value
-    
-    def __delitem__(self, key):
-        """Forward item deletion."""
-        del self.features[key]

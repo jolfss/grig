@@ -14,7 +14,7 @@ class Parameters:
     `(T,N,3)@cuda float`"""
 
     unnorm_rotations : torch.Tensor 
-    """The unnormalized quaternions (qx,qy,qz,qw)? representation of the gaussians' rotations.
+    """The unnormalized quaternions (qw,qx,qy,qz) representation of the gaussians' rotations.
     `(T,N,4)@cuda float`"""
 
     log_scales : torch.Tensor 

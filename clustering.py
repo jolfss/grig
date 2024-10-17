@@ -20,7 +20,7 @@ class Clustering:
 
     centers : torch.Tensor
     """The (x,y,z) centers for each of the clusters for each timestep.
-    `(T,num_clusters,3)@cpu float`"""
+    `(T,num_clusters,3)@cuda float`"""
 
     transformations : torch.Tensor
     """The transformations of each cluster represented as [x,y,z,qw,qx,qy,qz].
@@ -36,14 +36,23 @@ class Clustering:
         self.labels = torch.zeros((features.N),device="cuda").long() - 1
         self.labels[features.is_fg] = labels
 
-        self.masks = torch.zeros((num_clusters, features.N), device="cuda").long()
-        self.centers = torch.zeros((features.T, num_clusters, 3), device="cpu")
-        self.transformations = torch.zeros((features.T,num_clusters,7))
+        self.masks = torch.zeros((num_clusters, features.N), device="cuda", dtype=torch.bool)
+        self.centers = torch.zeros((features.T, num_clusters, 3), device="cuda")
+        self.transformations = torch.zeros((features.T,num_clusters,7), device="cuda")
         for c in range(num_clusters):
             mask = (self.labels==c)
             self.masks[c,:] = mask
             # NOTE: assumes no empty clusters
             self.centers[:,c,:] = (features.pos * mask.unsqueeze(-1)).sum(dim=1) / mask.sum() 
             self.transformations[:,c,:] = (torch.cat((features.pos,features.rot),dim=-1) * mask.unsqueeze(-1)).sum(dim=1) / mask.sum() 
+
+        # ASSERT MASKS DISJOINT AND COVER
+        total = 0
+        for i in range(num_clusters):
+            for j in range(num_clusters):
+                if i==j: continue
+                assert (self.masks[i] & self.masks[j]).sum() ==0
+            total += self.masks[i].sum() 
+        assert total == features.is_fg.sum()
 
         
