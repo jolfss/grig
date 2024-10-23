@@ -237,17 +237,22 @@ def load_scene_and_clustering(filepath: str) -> Tuple[List[Dict[str, torch.Tenso
     clustering = data['clustering']
     return scene_data, clustering
 
-def find_nearest_neighbor_chains(clustering: Clustering, max_distance: float = 0.5) -> List[List[int]]:
-    """ Find chains of clusters by starting from each cluster and expanding to its nearest neighbor iteratively. """
-    centers_t = clustering.centers.cpu().numpy()  # (T, K, 3)
-    num_clusters = centers_t.shape[1]
-    centers = centers_t[0]  # Consider centers at the first timestep for simplicity
-
+def find_nearest_neighbor_chains(clustering: Clustering,  max_distance: float = 0.5) -> List[List[int]]:
+    """ Find chains of clusters by starting from each cluster and expanding to its nearest neighbor iteratively using combined features. """
+    centers_t = clustering.centers.cpu().numpy()       # (T, K, 3)
+    dpos_t = clustering.center_dpos.cpu().numpy()          # (T, K, 3)
+    drot_t = clustering.center_drot.cpu().numpy()          # (T, K, 3)
+    
+    # Combine features at the first timestep
+    combined_features = np.hstack((centers_t[0], dpos_t[0], drot_t[0]))  # Shape: (K, 9)
+    
+    num_clusters = combined_features.shape[0]
+    
     visited = np.zeros(num_clusters, dtype=bool)
-    cluster_chains = []  # To store chains of clusters
+    cluster_chains = []
 
-    # Use KDTree for fast nearest neighbor search
-    tree = KDTree(centers)
+    # Use KDTree with combined features
+    tree = KDTree(combined_features)
 
     for i in range(num_clusters):
         if visited[i]:
@@ -259,7 +264,7 @@ def find_nearest_neighbor_chains(clustering: Clustering, max_distance: float = 0
 
         while True:
             # Query for neighbors within max_distance
-            distances, indices = tree.query(centers[current_cluster].reshape(1, -1), k=num_clusters)
+            distances, indices = tree.query(combined_features[current_cluster].reshape(1, -1), k=num_clusters)
             distances = distances.flatten()
             indices = indices.flatten()
 
@@ -385,7 +390,7 @@ def update_lineset(t:int, clustering:Clustering, w2c:np.ndarray, xform_lineset:o
     # Update the visualization
     vis.update_geometry(xform_lineset)
 
-def main(filepath_npz: str, config: Config, clustering_filepath: str = "clustering.npz", save_path: str = "clustering.npz"):
+def main(filepath_npz: str, config: Config, clustering_filepath: str = None, save_path: str = "clustering.npz"):
     if clustering_filepath is not None:
         print("Loading clustering from file.")
         scene_data, clustering = load_scene_and_clustering(clustering_filepath)
@@ -476,7 +481,7 @@ def main(filepath_npz: str, config: Config, clustering_filepath: str = "clusteri
 import sys
 if __name__ == "__main__":
     config = KMeansConfig(
-        timestride=150,
+        timestride=50,
         POS=1,
         DPOS=1,
         DROT=1,
