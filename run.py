@@ -13,6 +13,8 @@ from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 from typing import Dict, List, Tuple
 from scipy.spatial.transform import Rotation as R  # To handle quaternion-based rotations
+from sklearn.neighbors import KDTree
+from sklearn.cluster import AgglomerativeClustering
 
 # types
 from parameters import Parameters
@@ -38,7 +40,7 @@ fps = 20
 #   methods   #
 #-------------#
 @torch.no_grad()
-def solve(filepath_npz:str, config:Config) -> Tuple[Dict[str, torch.Tensor],Clustering]:
+def solve(filepath_npz: str, config: Config, save_path: str = None) -> Tuple[Dict[str, torch.Tensor], Clustering]:
     """
     The clustering algorithm `(param_filepath, config) -> (scene_data, clustering)`. 
     """
@@ -132,7 +134,6 @@ def solve(filepath_npz:str, config:Config) -> Tuple[Dict[str, torch.Tensor],Clus
                      .float()\
                      .to("cuda")[...,[3,0,1,2]] # convert to wxyz format
 
-
     # Pass into Grig eventually
     # Grig(...)
 
@@ -169,6 +170,10 @@ def solve(filepath_npz:str, config:Config) -> Tuple[Dict[str, torch.Tensor],Clus
         if config.remove_bg:
             rendervar = {k: v[features.is_fg] for k, v in rendervar.items()}  
         scene_data.append(rendervar)
+
+    # Save clustering if requested
+    if save_path is not None:
+        save_scene_and_clustering(scene_data, clustering, save_path)
 
     return scene_data, clustering
 
@@ -215,6 +220,123 @@ def initialize_xform_lineset(clustering:Clustering, vis:o3d.visualization.Visual
     lineset.colors = o3d.utility.Vector3dVector(cluster_center_xform_colors)
     vis.add_geometry(lineset)
     return lineset
+
+def save_scene_and_clustering(scene_data: List[Dict[str, torch.Tensor]], clustering: Clustering, filepath: str):
+    """ Saves scene_data and clustering information to a file. """
+    data = {
+        'scene_data': scene_data,
+        'clustering': clustering
+    }
+    torch.save(data, filepath)
+
+
+def load_scene_and_clustering(filepath: str) -> Tuple[List[Dict[str, torch.Tensor]], Clustering]:
+    """ Loads scene_data and clustering information from a file. """
+    data = torch.load(filepath)
+    scene_data = data['scene_data']
+    clustering = data['clustering']
+    return scene_data, clustering
+
+def find_nearest_neighbor_chains(clustering: Clustering, max_distance: float = 0.5) -> List[List[int]]:
+    """ Find chains of clusters by starting from each cluster and expanding to its nearest neighbor iteratively. """
+    centers_t = clustering.centers.cpu().numpy()  # (T, K, 3)
+    num_clusters = centers_t.shape[1]
+    centers = centers_t[0]  # Consider centers at the first timestep for simplicity
+
+    visited = np.zeros(num_clusters, dtype=bool)
+    cluster_chains = []  # To store chains of clusters
+
+    # Use KDTree for fast nearest neighbor search
+    tree = KDTree(centers)
+
+    for i in range(num_clusters):
+        if visited[i]:
+            continue
+
+        chain = [i]
+        visited[i] = True
+        current_cluster = i
+
+        while True:
+            # Query for neighbors within max_distance
+            distances, indices = tree.query(centers[current_cluster].reshape(1, -1), k=num_clusters)
+            distances = distances.flatten()
+            indices = indices.flatten()
+
+            # Find the nearest unvisited neighbor within max_distance
+            nearest_neighbor = -1
+            for dist, idx in zip(distances[1:], indices[1:]):  # Skip the first entry (itself)
+                if dist > max_distance:
+                    break  # Neighbors are sorted by distance, break early
+                if not visited[idx]:
+                    nearest_neighbor = idx
+                    break
+
+            if nearest_neighbor == -1:
+                break
+
+            # Add the nearest neighbor to the chain
+            chain.append(nearest_neighbor)
+            visited[nearest_neighbor] = True
+            current_cluster = nearest_neighbor
+
+        cluster_chains.append(chain)
+
+    print(f"Found {len(cluster_chains)} chains of clusters.")
+    return cluster_chains
+
+def compute_joints(clustering: Clustering, cluster_chains: List[List[int]]) -> np.ndarray:
+    """ Computes the joint positions as the midpoint between consecutive clusters in each chain."""
+    centers_t = clustering.centers.cpu().numpy()  # (T, K, 3)
+    num_timesteps = centers_t.shape[0]
+
+    # Compute the number of joints based on consecutive pairs in chains
+    num_joints = sum(len(chain) - 1 for chain in cluster_chains)
+    
+    # Initialize the joints tensor
+    joints_t = np.zeros((num_timesteps, num_joints, 3))  # (T, num_joints, 3)
+
+    joint_idx = 0
+    for chain in cluster_chains:
+        pairs = [(chain[k], chain[k + 1]) for k in range(len(chain) - 1)]
+
+        for i, j in pairs:
+            # Vectorized midpoint computation for all timesteps
+            joints_t[:, joint_idx, :] = (centers_t[:, i, :] + centers_t[:, j, :]) / 2.0
+            joint_idx += 1
+
+    print(f"Computed {num_joints} joints.")
+    return joints_t
+
+def initialize_joint_dots(joints: np.ndarray, vis: o3d.visualization.Visualizer) -> List[o3d.geometry.TriangleMesh]:
+    """ Initializes the memory for the joint dots visualization. """
+    joint_dots = []
+    for _ in range(joints.shape[1]):
+        joint = o3d.geometry.TriangleMesh.create_sphere(radius=0.003)
+        joint.paint_uniform_color([1, 0, 0])
+        joint_dots.append(joint)
+        vis.add_geometry(joint)
+    
+    return joint_dots
+
+def update_joints(t: int, joints_t: np.ndarray, joint_dots: List[o3d.geometry.TriangleMesh], w2c: np.ndarray, vis: o3d.visualization.Visualizer):
+    """ Updates the joint dots visualization to the current time step `t`, projecting them closer to the camera. """
+    # Get the joint positions for the current time step
+    joints_at_t = joints_t[t]
+    
+    # Add homogeneous coordinates to the joint positions
+    __new_joint_points = np.concatenate([joints_at_t, np.ones((joints_at_t.shape[0], 1))], axis=-1)  # (num_joints, 4)
+
+    # Project the joint points to bring them closer to the camera
+    __new_joint_points = __new_joint_points @ w2c.T
+    __new_joint_points[:, :3] *= 0.25  # Move the points closer to the camera for visibility
+    __new_joint_points = __new_joint_points @ np.linalg.inv(w2c).T  # Reproject back to world coordinates
+
+    # Update the joint dot positions
+    for idx, joint in enumerate(joint_dots):
+        joint.translate(__new_joint_points[idx, :3], relative=False)
+        vis.update_geometry(joint)
+
 
 #@GPT
 def update_lineset(t:int, clustering:Clustering, w2c:np.ndarray, xform_lineset:o3d.geometry.LineSet, vis:o3d.visualization.Visualizer):
@@ -263,8 +385,13 @@ def update_lineset(t:int, clustering:Clustering, w2c:np.ndarray, xform_lineset:o
     # Update the visualization
     vis.update_geometry(xform_lineset)
 
-def main(filepath_npz:str, config:Config):
-    scene_data, clustering = solve(filepath_npz, config)
+def main(filepath_npz: str, config: Config, clustering_filepath: str = "clustering.npz", save_path: str = "clustering.npz"):
+    if clustering_filepath is not None:
+        print("Loading clustering from file.")
+        scene_data, clustering = load_scene_and_clustering(clustering_filepath)
+    else:
+        print("Running clustering algorithm.")
+        scene_data, clustering = solve(filepath_npz, config, save_path=save_path)
 
     vis = o3d.visualization.Visualizer()
     vis.create_window(width=int(w * view_scale), height=int(h * view_scale), visible=True)
@@ -284,6 +411,11 @@ def main(filepath_npz:str, config:Config):
 
     cluster_center_dots = initialize_cluster_center_dots(clustering, vis)
     xform_lineset = initialize_xform_lineset(clustering, vis)
+
+    # Add joint initialization
+    cluster_chains = find_nearest_neighbor_chains(clustering, max_distance=0.5)
+    joints_t = compute_joints(clustering, cluster_chains)
+    joint_dots = initialize_joint_dots(joints_t, vis)
 
     #----------------------#
     #   set up viewpoint   #
@@ -328,8 +460,9 @@ def main(filepath_npz:str, config:Config):
         vis.update_geometry(pcd)
 
         update_cluster_centers(t, clustering, w2c, cluster_center_dots, vis)
-
         update_lineset(t, clustering, w2c, xform_lineset, vis)
+
+        update_joints(t, joints_t, joint_dots, w2c, vis)
 
         if not vis.poll_events():
             break
@@ -343,7 +476,7 @@ def main(filepath_npz:str, config:Config):
 import sys
 if __name__ == "__main__":
     config = KMeansConfig(
-        timestride=5,
+        timestride=150,
         POS=1,
         DPOS=1,
         DROT=1,
