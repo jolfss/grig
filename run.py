@@ -15,6 +15,8 @@ from typing import Dict, List, Tuple
 from scipy.spatial.transform import Rotation as R  # To handle quaternion-based rotations
 from sklearn.neighbors import KDTree
 from sklearn.cluster import AgglomerativeClustering
+from dtaidistance import dtw
+from scipy.cluster.hierarchy import linkage, fcluster
 
 # types
 from parameters import Parameters
@@ -237,37 +239,53 @@ def load_scene_and_clustering(filepath: str) -> Tuple[List[Dict[str, torch.Tenso
     clustering = data['clustering']
     return scene_data, clustering
 
-def find_nearest_neighbor_chains(clustering: Clustering,  max_distance: float = 0.5) -> List[List[int]]:
-    """ Find chains of clusters by starting from each cluster and expanding to its nearest neighbor iteratively using combined features. """
+def find_nearest_neighbor_chains_all_timesteps(clustering: Clustering, max_distance: float = 0.5) -> List[List[int]]:
+    """ Find chains of clusters by considering all timesteps to determine the best adjacent cluster pairs. """
     centers_t = clustering.centers.cpu().numpy()       # (T, K, 3)
-    dpos_t = clustering.center_dpos.cpu().numpy()          # (T, K, 3)
-    drot_t = clustering.center_drot.cpu().numpy()          # (T, K, 3)
+    dpos_t = clustering.center_dpos.cpu().numpy()      # (T, K, 3)
+    drot_t = clustering.center_drot.cpu().numpy()      # (T, K, 3)
     
-    # Combine features at the first timestep
-    combined_features = np.hstack((centers_t[0], dpos_t[0], drot_t[0]))  # Shape: (K, 9)
+    T, K, _ = centers_t.shape
+    
+    # Aggregate features over all timesteps. This is bad but it does achieve a better result ...
+    centers_mean = centers_t.mean(axis=0)              # (K, 3)
+    centers_std = centers_t.std(axis=0)                # (K, 3)
+    
+    dpos_mean = dpos_t.mean(axis=0)                    # (K, 3)
+    dpos_std = dpos_t.std(axis=0)                      # (K, 3)
+    
+    drot_mean = drot_t.mean(axis=0)                    # (K, 3)
+    drot_std = drot_t.std(axis=0)                      # (K, 3)
+    
+    # Combine aggregated features into a single feature vector per cluster
+    combined_features = np.hstack((
+        centers_mean, centers_std,
+        dpos_mean, dpos_std,
+        drot_mean, drot_std
+    ))  # Shape: (K, 18)
     
     num_clusters = combined_features.shape[0]
     
     visited = np.zeros(num_clusters, dtype=bool)
     cluster_chains = []
-
-    # Use KDTree with combined features
+    
+    # Use KDTree with aggregated combined features
     tree = KDTree(combined_features)
-
+    
     for i in range(num_clusters):
         if visited[i]:
             continue
-
+    
         chain = [i]
         visited[i] = True
         current_cluster = i
-
+    
         while True:
-            # Query for neighbors within max_distance
+            # Query for neighbors sorted by distance
             distances, indices = tree.query(combined_features[current_cluster].reshape(1, -1), k=num_clusters)
             distances = distances.flatten()
             indices = indices.flatten()
-
+    
             # Find the nearest unvisited neighbor within max_distance
             nearest_neighbor = -1
             for dist, idx in zip(distances[1:], indices[1:]):  # Skip the first entry (itself)
@@ -276,17 +294,17 @@ def find_nearest_neighbor_chains(clustering: Clustering,  max_distance: float = 
                 if not visited[idx]:
                     nearest_neighbor = idx
                     break
-
+    
             if nearest_neighbor == -1:
                 break
-
+    
             # Add the nearest neighbor to the chain
             chain.append(nearest_neighbor)
             visited[nearest_neighbor] = True
             current_cluster = nearest_neighbor
-
+    
         cluster_chains.append(chain)
-
+    
     print(f"Found {len(cluster_chains)} chains of clusters.")
     return cluster_chains
 
@@ -390,7 +408,7 @@ def update_lineset(t:int, clustering:Clustering, w2c:np.ndarray, xform_lineset:o
     # Update the visualization
     vis.update_geometry(xform_lineset)
 
-def main(filepath_npz: str, config: Config, clustering_filepath: str = None, save_path: str = "clustering.npz"):
+def main(filepath_npz: str, config: Config, clustering_filepath: str = None , save_path: str = "clustering.npz"):
     if clustering_filepath is not None:
         print("Loading clustering from file.")
         scene_data, clustering = load_scene_and_clustering(clustering_filepath)
@@ -417,10 +435,15 @@ def main(filepath_npz: str, config: Config, clustering_filepath: str = None, sav
     cluster_center_dots = initialize_cluster_center_dots(clustering, vis)
     xform_lineset = initialize_xform_lineset(clustering, vis)
 
+
+    #----------------------#
+    #     Evan's Joint     #
+    #----------------------#
     # Add joint initialization
-    cluster_chains = find_nearest_neighbor_chains(clustering, max_distance=0.5)
-    joints_t = compute_joints(clustering, cluster_chains)
-    joint_dots = initialize_joint_dots(joints_t, vis)
+    # cluster_chains = find_nearest_neighbor_chains_all_timesteps(clustering, max_distance=0.5)
+    # joints_t = compute_joints(clustering, cluster_chains)
+
+    # joint_dots = initialize_joint_dots(joints_t, vis)
 
     #----------------------#
     #   set up viewpoint   #
@@ -467,7 +490,10 @@ def main(filepath_npz: str, config: Config, clustering_filepath: str = None, sav
         update_cluster_centers(t, clustering, w2c, cluster_center_dots, vis)
         update_lineset(t, clustering, w2c, xform_lineset, vis)
 
-        update_joints(t, joints_t, joint_dots, w2c, vis)
+        #----------------------#
+        #     Evan's Joint     #
+        #----------------------#
+        # update_joints(t, joints_t, joint_dots, w2c, vis)
 
         if not vis.poll_events():
             break
@@ -481,7 +507,7 @@ def main(filepath_npz: str, config: Config, clustering_filepath: str = None, sav
 import sys
 if __name__ == "__main__":
     config = KMeansConfig(
-        timestride=50,
+        timestride=1,
         POS=1,
         DPOS=1,
         DROT=1,
