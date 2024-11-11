@@ -14,6 +14,7 @@ from sklearn.preprocessing import StandardScaler
 from typing import Dict, List, Tuple
 from scipy.spatial.transform import Rotation as R  # To handle quaternion-based rotations
 from sklearn.neighbors import KDTree
+from sklearn.metrics import pairwise_distances
 from sklearn.cluster import AgglomerativeClustering
 from dtaidistance import dtw
 from scipy.cluster.hierarchy import linkage, fcluster
@@ -68,6 +69,12 @@ def solve(filepath_npz: str, config: Config, save_path: str = None) -> Tuple[Dic
     kmeans.fit(fg_features)
     fg_labels = kmeans.labels_
 
+    ########
+    # JOINTS STUFF
+    distances = pairwise_distances(fg_features, kmeans.cluster_centers_)
+    second_nearest_clusters = distances.argsort(axis=1)[:, 1] # (N,)
+    ########
+
     clustering = Clustering(
         config.K, 
         features, 
@@ -76,65 +83,66 @@ def solve(filepath_npz: str, config: Config, save_path: str = None) -> Tuple[Dic
 
     ### WIP: only animating the cluster centers, baking offsets
     # TODO: Transform rotation around the center instead of just translation.
-    for c in range(clustering.num_clusters):
-        mask = clustering.masks[c]
-        # 1) get transformation relative to cluster center, 
-        # 2) rotate into cluster coordinate system, 
-        # 3) mean over time
-        # 4) reproject to world
-        
-        # positions are now in cluster-centered world-aligned coordinates
-        features.pos[:,mask] = features.pos[:,mask] - clustering.centers[:,c].unsqueeze(1)
-    
-        for t in range(features.T):
-            R_wtoc = R.from_quat(clustering.transformations[t,c,[4,5,6,3]]
-                                           .cpu()
-                                           .numpy()).inv()
+    if False:
+        for c in range(clustering.num_clusters):
+            mask = clustering.masks[c]
+            # 1) get transformation relative to cluster center, 
+            # 2) rotate into cluster coordinate system, 
+            # 3) mean over time
+            # 4) reproject to world
             
-            # positions are now in cluster-centered cluster-aligned coordinates
-            features.pos[t,mask] = \
-                torch.from_numpy((R_wtoc
-                                        .apply(features.pos[t,mask]
-                                                       .cpu()
-                                                       .numpy())))\
-                     .float()\
-                     .to("cuda")
-            
-            # rotations are now w.r.t. cluster axes
-            features.rot[t,mask] = \
-                torch.from_numpy((R_wtoc * 
-                                 (R.from_quat(features.rot[...,[1,2,3,0]][t,mask]
-                                                      .reshape((-1,4))
-                                                      .cpu()
-                                                      .numpy())))
-                                 .as_quat())\
-                     .float()\
-                     .to("cuda") # leave in xyzw format for now
+            # positions are now in cluster-centered world-aligned coordinates
+            features.pos[:,mask] = features.pos[:,mask] - clustering.centers[:,c].unsqueeze(1)
         
-        # each gaussian positions/rotations is now averaged over time w.r.t. the cluster coordinates
-        features.pos[:,mask] = features.pos[:,mask].mean(dim=0, keepdim=True) 
-        features.rot[:,mask] = features.rot[:,mask].mean(dim=0, keepdim=True)
+            for t in range(features.T):
+                R_wtoc = R.from_quat(clustering.transformations[t,c,[4,5,6,3]]
+                                            .cpu()
+                                            .numpy()).inv()
+                
+                # positions are now in cluster-centered cluster-aligned coordinates
+                features.pos[t,mask] = \
+                    torch.from_numpy((R_wtoc
+                                            .apply(features.pos[t,mask]
+                                                        .cpu()
+                                                        .numpy())))\
+                        .float()\
+                        .to("cuda")
+                
+                # rotations are now w.r.t. cluster axes
+                features.rot[t,mask] = \
+                    torch.from_numpy((R_wtoc * 
+                                    (R.from_quat(features.rot[...,[1,2,3,0]][t,mask]
+                                                        .reshape((-1,4))
+                                                        .cpu()
+                                                        .numpy())))
+                                    .as_quat())\
+                        .float()\
+                        .to("cuda") # leave in xyzw format for now
+            
+            # each gaussian positions/rotations is now averaged over time w.r.t. the cluster coordinates
+            features.pos[:,mask] = features.pos[:,mask].mean(dim=0, keepdim=True) 
+            features.rot[:,mask] = features.rot[:,mask].mean(dim=0, keepdim=True)
 
-        # transform back to world
-        for t in range(features.T):
-            R_ctow = R.from_quat(clustering.transformations[t,c,[4,5,6,3]]
-                                           .cpu()
-                                           .numpy())
+            # transform back to world
+            for t in range(features.T):
+                R_ctow = R.from_quat(clustering.transformations[t,c,[4,5,6,3]]
+                                            .cpu()
+                                            .numpy())
 
-            features.pos[t,mask] = clustering.centers[t,c] + \
-                torch.from_numpy(R_ctow.apply(features.pos[t,mask]
-                                                      .reshape((-1,3))
-                                                      .cpu()
-                                                      .numpy()))\
-                     .float()\
-                     .to("cuda")
+                features.pos[t,mask] = clustering.centers[t,c] + \
+                    torch.from_numpy(R_ctow.apply(features.pos[t,mask]
+                                                        .reshape((-1,3))
+                                                        .cpu()
+                                                        .numpy()))\
+                        .float()\
+                        .to("cuda")
 
-            features.rot[t,mask] = \
-                torch.from_numpy((R_ctow * 
-                                  R.from_quat(features.rot[...,[1,2,3,0]][t,mask].cpu().numpy()))
-                                 .as_quat())\
-                     .float()\
-                     .to("cuda")[...,[3,0,1,2]] # convert to wxyz format
+                features.rot[t,mask] = \
+                    torch.from_numpy((R_ctow * 
+                                    R.from_quat(features.rot[...,[1,2,3,0]][t,mask].cpu().numpy()))
+                                    .as_quat())\
+                        .float()\
+                        .to("cuda")[...,[3,0,1,2]] # convert to wxyz format
 
     # Pass into Grig eventually
     # Grig(...)
@@ -150,6 +158,9 @@ def solve(filepath_npz: str, config: Config, save_path: str = None) -> Tuple[Dic
         feature_colors = torch.abs(features.drot_dt[:,:,:3][:,features.is_fg]) #(T,N[is_fg],3)
     elif config.color_mode == "CLUSTERS":
         cluster_colors = cmap(fg_labels)[:, :3]  
+        feature_colors = torch.from_numpy(cluster_colors).float().to("cuda").expand((features.T,-1,3))
+    elif config.color_mode == "2NN":
+        cluster_colors = cmap(second_nearest_clusters)[:, :3]  
         feature_colors = torch.from_numpy(cluster_colors).float().to("cuda").expand((features.T,-1,3))
     else: #RGB
         pass
@@ -409,6 +420,7 @@ def update_lineset(t:int, clustering:Clustering, w2c:np.ndarray, xform_lineset:o
     vis.update_geometry(xform_lineset)
 
 def main(filepath_npz: str, config: Config, clustering_filepath: str = None , save_path: str = "clustering.npz"):
+    joint = True
     if clustering_filepath is not None:
         print("Loading clustering from file.")
         scene_data, clustering = load_scene_and_clustering(clustering_filepath)
@@ -440,10 +452,11 @@ def main(filepath_npz: str, config: Config, clustering_filepath: str = None , sa
     #     Evan's Joint     #
     #----------------------#
     # Add joint initialization
-    # cluster_chains = find_nearest_neighbor_chains_all_timesteps(clustering, max_distance=0.5)
-    # joints_t = compute_joints(clustering, cluster_chains)
+    if joint: 
+        cluster_chains = find_nearest_neighbor_chains_all_timesteps(clustering, max_distance=0.5)
+        joints_t = compute_joints(clustering, cluster_chains)
 
-    # joint_dots = initialize_joint_dots(joints_t, vis)
+        joint_dots = initialize_joint_dots(joints_t, vis)
 
     #----------------------#
     #   set up viewpoint   #
@@ -493,7 +506,8 @@ def main(filepath_npz: str, config: Config, clustering_filepath: str = None , sa
         #----------------------#
         #     Evan's Joint     #
         #----------------------#
-        # update_joints(t, joints_t, joint_dots, w2c, vis)
+        if joint: 
+            update_joints(t, joints_t, joint_dots, w2c, vis)
 
         if not vis.poll_events():
             break
