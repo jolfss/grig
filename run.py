@@ -8,6 +8,7 @@ import torch
 import numpy as np
 
 # our imports
+import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
@@ -37,7 +38,7 @@ from clustering import Clustering
 w, h = 640, 360
 near, far = 0.01, 100.0
 view_scale = 3.9
-fps = 20
+fps = 15
 
 #-------------#
 #   methods   #
@@ -56,30 +57,65 @@ def solve(filepath_npz: str, config: Config, save_path: str = None) -> Tuple[Dic
 
     print("Preparing Foreground Features")
     features = Features(params, config)
-    fg_features = features.features[features.is_fg]
-    fg_features = fg_features.cpu().numpy()
+    np_fg_features = features.features[features.is_fg].cpu().numpy()
 
     if config.normalize_features:
         print("Normalizing Foreground Features")
         scaler = StandardScaler()
-        fg_features = scaler.fit_transform(fg_features)
+        np_fg_features = scaler.fit_transform(np_fg_features)
 
     print(F"Clustering Foreground Gaussians") 
     kmeans = KMeans(n_clusters=config.K)
-    kmeans.fit(fg_features)
-    fg_labels = kmeans.labels_
+    kmeans.fit(np_fg_features)
+    np_fg_labels = kmeans.labels_
 
-    ########
-    # JOINTS STUFF
-    distances = pairwise_distances(fg_features, kmeans.cluster_centers_)
-    second_nearest_clusters = distances.argsort(axis=1)[:, 1] # (N,)
-    ########
+    ### BEGIN WIP: Permutation canonicalization
+    # Step 1: Compute cluster sizes
+    cluster_sizes = np.bincount(np_fg_labels, minlength=config.K)
 
+    # Step 2: Determine new label order
+    sorted_indices = np.argsort(-cluster_sizes)  # Indices of clusters sorted by size (descending)
+    remapping = {old_label: new_label for new_label, old_label in enumerate(sorted_indices)}
+
+    # Step 3: Apply the remapping to labels
+    canonicalized_labels = np.array([remapping[label] for label in np_fg_labels])
+
+    # Update the clustering object with canonicalized labels
     clustering = Clustering(
-        config.K, 
-        features, 
-        torch.from_numpy(fg_labels).long().to("cuda")
+        config.K,
+        features,
+        torch.from_numpy(canonicalized_labels).long().to("cuda")
     )
+
+    # Step 4: Recompute any matrices/statistics with the new labels
+    distances = pairwise_distances(np_fg_features, kmeans.cluster_centers_)
+    sorted_clusters = distances.argsort(axis=1)  # (N, K)
+
+    # Update 1NN and 2NN IDs with canonicalized labels
+    _1NN_ids = np.array([remapping[label] for label in sorted_clusters[:, 0]])
+    _2NN_ids = np.array([remapping[label] for label in sorted_clusters[:, 1]])
+
+    # Recompute the matrix with the new canonicalized labels
+    matrix = np.zeros((config.K, config.K), dtype=int)
+    for i, j in zip(_1NN_ids, _2NN_ids):
+        matrix[i, j] += 1
+
+    # Step 5: Sort matrix for plotting
+    sorted_matrix = matrix[sorted_indices, :][:, sorted_indices]
+    sorted_labels = np.arange(config.K)[sorted_indices]
+
+    # Step 6: Plot the sorted matrix
+    plt.figure(figsize=(8, 6))
+    plt.imshow(sorted_matrix, cmap='viridis', origin='upper')
+    plt.colorbar(label="Count")
+    plt.title("2D Matrix of 1NN and 2NN Counts (Canonicalized)")
+    plt.xlabel("2NN Cluster ID")
+    plt.ylabel("1NN Cluster ID")
+    plt.xticks(ticks=range(config.K), labels=sorted_labels)
+    plt.yticks(ticks=range(config.K), labels=sorted_labels)
+    plt.grid(False)
+    plt.show()
+    ### ENDWIP
 
     ### WIP: only animating the cluster centers, baking offsets
     # TODO: Transform rotation around the center instead of just translation.
@@ -143,6 +179,7 @@ def solve(filepath_npz: str, config: Config, save_path: str = None) -> Tuple[Dic
                                     .as_quat())\
                         .float()\
                         .to("cuda")[...,[3,0,1,2]] # convert to wxyz format
+    ### ENDWIP
 
     # Pass into Grig eventually
     # Grig(...)
@@ -150,19 +187,56 @@ def solve(filepath_npz: str, config: Config, save_path: str = None) -> Tuple[Dic
     print(F"Coloring Gaussians (Mode={config.color_mode})")
     cmap = cm.get_cmap('turbo', config.K)
     feature_colors = None
-    if config.color_mode == "POS":
+    if config.color_mode == "POS": # Color by magnitude of position
         feature_colors = torch.abs(features.pos[:,:,:3][:,features.is_fg]) #(T,N[is_fg],3)
-    elif config.color_mode == "DPOS":
+    elif config.color_mode == "DPOS": # Color by magnitude of velocity
         feature_colors = torch.abs(features.dpos_dt[:,:,:3][:,features.is_fg]) #(T,N[is_fg],3)
-    elif config.color_mode == "DROT":
+    elif config.color_mode == "DROT": # Color by magnitude of angular velocity
         feature_colors = torch.abs(features.drot_dt[:,:,:3][:,features.is_fg]) #(T,N[is_fg],3)
-    elif config.color_mode == "CLUSTERS":
-        cluster_colors = cmap(fg_labels)[:, :3]  
+    elif config.color_mode == "CLUSTERS": # Color by cluster assignment
+        cluster_colors = cmap(np_fg_labels)[:, :3]  
         feature_colors = torch.from_numpy(cluster_colors).float().to("cuda").expand((features.T,-1,3))
-    elif config.color_mode == "2NN":
+    elif config.color_mode == "2NN": # Color by second nearest neighbor 
+        distances = pairwise_distances(np_fg_features, kmeans.cluster_centers_)
+        second_nearest_clusters = distances.argsort(axis=1)[:, 1] # (N,)
         cluster_colors = cmap(second_nearest_clusters)[:, :3]  
         feature_colors = torch.from_numpy(cluster_colors).float().to("cuda").expand((features.T,-1,3))
-    else: #RGB
+    elif config.color_mode == "PENALIZE_FIRST": # Color by nearest neighbor after applying a penalty to the 1NN
+        distances = pairwise_distances(np_fg_features, kmeans.cluster_centers_)
+        distances_indices = distances.argsort(axis=1)
+        for i in range(distances.shape[0]):
+            distances[i, distances_indices[i, 0]] *= 1.2
+        distances_first_penalized = distances.argsort(axis=1)[:, 0] # (N,)
+        cluster_colors = cmap(distances_first_penalized)[:, :3]  
+        feature_colors = torch.from_numpy(cluster_colors).float().to("cuda").expand((features.T,-1,3))
+    elif config.color_mode == "INDECISION": # Color by if nearest neighbor changed after applying 1NN penalty
+        cmap = cm.get_cmap("viridis",2)
+        distances = pairwise_distances(np_fg_features, kmeans.cluster_centers_)
+        distances_indices = distances.argsort(axis=1)
+        initial_min_indices = distances.argsort(axis=1)[:, 0]
+        for i in range(distances.shape[0]):
+            distances[i, distances_indices[i, 0]] *= 1.2
+        final_min_indices = distances.argsort(axis=1)[:, 0]
+        flipped_array = (initial_min_indices != final_min_indices).astype(int)
+        _feature_colors = cmap(flipped_array)[:, :3]  
+        feature_colors = torch.from_numpy(_feature_colors).float().to("cuda").expand((features.T,-1,3))
+    elif config.color_mode == "INDECISION_CONTINUOUS": # Color by penalty factor required to cause flip from 1NN to 2NN
+        cmap = cm.get_cmap("inferno")
+        distances = pairwise_distances(np_fg_features, kmeans.cluster_centers_)
+        distances_indices = distances.argsort(axis=1)
+        initial_min_indices = distances.argsort(axis=1)[:, 0]
+        sorted_distances = distances.copy()
+        sorted_indices = distances_indices.copy()
+        initial_min_values = sorted_distances[np.arange(distances.shape[0]), sorted_indices[:, 0]]
+        initial_second_min_values = sorted_distances[np.arange(distances.shape[0]), sorted_indices[:, 1]]
+        flip_factors = initial_second_min_values / initial_min_values
+        percentile_5 = np.percentile(flip_factors, 5)
+        percentile_95 = np.percentile(flip_factors, 95)
+        flip_factors_clipped = np.clip(flip_factors, percentile_5, percentile_95)
+        flip_factors_normalized = (1 - ((flip_factors_clipped - percentile_5) / (percentile_95 - percentile_5))) ** 3
+        _feature_colors = cmap(flip_factors_normalized)[:, :3]  
+        feature_colors = torch.from_numpy(_feature_colors).float().to("cuda").expand((features.T, -1, 3))
+    else: # The default coloring is to use RGB 
         pass
 
     colors = params.rgb_colors #NOTE: color is constant w.r.t. time
@@ -420,7 +494,7 @@ def update_lineset(t:int, clustering:Clustering, w2c:np.ndarray, xform_lineset:o
     vis.update_geometry(xform_lineset)
 
 def main(filepath_npz: str, config: Config, clustering_filepath: str = None , save_path: str = "clustering.npz"):
-    joint = True
+    joint = False
     if clustering_filepath is not None:
         print("Loading clustering from file.")
         scene_data, clustering = load_scene_and_clustering(clustering_filepath)
@@ -444,8 +518,8 @@ def main(filepath_npz: str, config: Config, clustering_filepath: str = None , sa
     pcd.colors = init_cols
     vis.add_geometry(pcd)
 
-    cluster_center_dots = initialize_cluster_center_dots(clustering, vis)
-    xform_lineset = initialize_xform_lineset(clustering, vis)
+    #cluster_center_dots = initialize_cluster_center_dots(clustering, vis)
+    #xform_lineset = initialize_xform_lineset(clustering, vis)
 
 
     #----------------------#
@@ -500,8 +574,8 @@ def main(filepath_npz: str, config: Config, clustering_filepath: str = None , sa
         pcd.colors = cols
         vis.update_geometry(pcd)
 
-        update_cluster_centers(t, clustering, w2c, cluster_center_dots, vis)
-        update_lineset(t, clustering, w2c, xform_lineset, vis)
+        #update_cluster_centers(t, clustering, w2c, cluster_center_dots, vis)
+        #update_lineset(t, clustering, w2c, xform_lineset, vis)
 
         #----------------------#
         #     Evan's Joint     #
