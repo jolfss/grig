@@ -4,8 +4,9 @@ from parameters import Parameters
 
 class Features:
     """
-    Representation of the features extracted from the parameter file.
+    The set of features in our working set for clustering/otherwise.
     """
+
     features : torch.Tensor
     """The output of some function on the input parameters.\n
     `(N,D*T//config.timestride)@cuda float`"""

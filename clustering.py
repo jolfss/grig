@@ -7,20 +7,17 @@ from scipy.spatial.transform import Rotation as R
 class Clustering:
     num_clusters : int
     """The number of clusters in this clustering."""
-    
-    features : Features
-    """The features of the clustered gaussians."""
 
     labels : torch.Tensor
-    """The cluster ids/labels of the gaussians.
-    [0,num_clusters) if part of a cluster, -1 if background
+    """The cluster ids/labels of the gaussians; indices are assigned starting with the most populated cluster, so index
+    0 is the most populated and K-1 is the least. Labels are `[0,num_clusters)` if in a cluster or `-1` if background.
     `(N,)@cuda long`"""
 
     masks : torch.Tensor
     """Boolean masks for each of the clusters.
     `(num_clusters,N)@cuda bool`"""
 
-    centers : torch.Tensor
+    center_pos : torch.Tensor
     """The (x,y,z) centers for each of the clusters for each timestep.
     `(T,num_clusters,3)@cuda float`"""
 
@@ -40,23 +37,26 @@ class Clustering:
         """
         TODO: docs
         """
+
+        # permute labels s.t. first indices correspond to most populous clusters
+        labels.apply_({old_label: new_label for new_label, old_label 
+                       in enumerate(np.argsort(-torch.bincount(labels, minlength=num_clusters)))}.get)
+
         self.num_clusters = num_clusters
-        self.features = features
         
         self.labels = torch.zeros((features.N),device="cuda").long() - 1
         self.labels[features.is_fg] = labels
 
         self.masks = torch.zeros((num_clusters, features.N), device="cuda", dtype=torch.bool)
-        self.centers = torch.zeros((features.T, num_clusters, 3), device="cuda")
+        self.center_pos = torch.zeros((features.T, num_clusters, 3), device="cuda")
         self.transformations = torch.zeros((features.T,num_clusters,7), device="cuda")
         for c in range(num_clusters):
             mask = (self.labels==c)
             self.masks[c,:] = mask
-            # NOTE: assumes no empty clusters
-            self.centers[:,c,:] = (features.pos * mask.unsqueeze(-1)).sum(dim=1) / mask.sum() 
+            self.center_pos[:,c,:] = (features.pos * mask.unsqueeze(-1)).sum(dim=1) / min(mask.sum(),1) 
             self.transformations[:,c,:] = (torch.cat((features.pos,features.rot),dim=-1) * mask.unsqueeze(-1)).sum(dim=1) / mask.sum() 
 
-        # ASSERT MASKS DISJOINT AND COVER
+        # assert masks are disjoint and cover
         total = 0
         for i in range(num_clusters):
             for j in range(num_clusters):
@@ -71,11 +71,11 @@ class Clustering:
     def compute_velocity(self, delta_t: float = 1.0) -> torch.Tensor:
         """ Compute velocity (dpos_dt) for cluster centers using finite differences. """
         # Assuming centers has shape (T, K, 3)
-        centers_np = self.centers.cpu().numpy()  # (T, K, 3)
+        centers_np = self.center_pos.cpu().numpy()  # (T, K, 3)
         velocity_np = np.zeros_like(centers_np)
         velocity_np[:-1] = (centers_np[1:] - centers_np[:-1]) / delta_t
         velocity_np[-1] = velocity_np[-2]  # Replicate last velocity
-        velocity_tensor = torch.from_numpy(velocity_np).float().to(self.centers.device)
+        velocity_tensor = torch.from_numpy(velocity_np).float().to(self.center_pos.device)
         return velocity_tensor
 
     def compute_angular_velocity(self, delta_t: float = 1.0) -> torch.Tensor:
@@ -101,5 +101,5 @@ class Clustering:
 
         drot_np[0, :, :] = drot_np[1, :, :]
         
-        drot_tensor = torch.from_numpy(drot_np).float().to(self.centers.device)
+        drot_tensor = torch.from_numpy(drot_np).float().to(self.center_pos.device)
         return drot_tensor

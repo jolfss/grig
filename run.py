@@ -31,6 +31,11 @@ from clustering import Clustering
 ##   1) There is a useful method [helpers.o3d_knn] for if we want to do shearing calculations.   ##
 ###################################################################################################
 
+#--------------#
+#   settings   #
+#--------------#
+USE_CLUSTER_TRANSFORMS = False
+
 #----------------------#
 #   global constants   #
 #----------------------#
@@ -68,121 +73,17 @@ def solve(filepath_npz: str, config: Config, save_path: str = None) -> Tuple[Dic
     kmeans = KMeans(n_clusters=config.K)
     kmeans.fit(np_fg_features)
     np_fg_labels = kmeans.labels_
+    np_feature_means = kmeans.cluster_centers_
 
-    ### BEGIN WIP: Permutation canonicalization
-    # Step 1: Compute cluster sizes
-    cluster_sizes = np.bincount(np_fg_labels, minlength=config.K)
-
-    # Step 2: Determine new label order
-    sorted_indices = np.argsort(-cluster_sizes)  # Indices of clusters sorted by size (descending)
-    remapping = {old_label: new_label for new_label, old_label in enumerate(sorted_indices)}
-
-    # Step 3: Apply the remapping to labels
-    canonicalized_labels = np.array([remapping[label] for label in np_fg_labels])
-
-    # Update the clustering object with canonicalized labels
     clustering = Clustering(
         config.K,
         features,
-        torch.from_numpy(canonicalized_labels).long().to("cuda")
+        torch.from_numpy(np_feature_means).long().to("cuda")
     )
 
-    # Step 4: Recompute any matrices/statistics with the new labels
-    distances = pairwise_distances(np_fg_features, kmeans.cluster_centers_)
-    sorted_clusters = distances.argsort(axis=1)  # (N, K)
+    __analyze_cluster_pairs(np_fg_features, np_feature_means)
 
-    # Update 1NN and 2NN IDs with canonicalized labels
-    _1NN_ids = np.array([remapping[label] for label in sorted_clusters[:, 0]])
-    _2NN_ids = np.array([remapping[label] for label in sorted_clusters[:, 1]])
-
-    # Recompute the matrix with the new canonicalized labels
-    matrix = np.zeros((config.K, config.K), dtype=int)
-    for i, j in zip(_1NN_ids, _2NN_ids):
-        matrix[i, j] += 1
-
-    # Step 5: Sort matrix for plotting
-    sorted_matrix = matrix[sorted_indices, :][:, sorted_indices]
-    sorted_labels = np.arange(config.K)[sorted_indices]
-
-    # Step 6: Plot the sorted matrix
-    plt.figure(figsize=(8, 6))
-    plt.imshow(sorted_matrix, cmap='viridis', origin='upper')
-    plt.colorbar(label="Count")
-    plt.title("2D Matrix of 1NN and 2NN Counts (Canonicalized)")
-    plt.xlabel("2NN Cluster ID")
-    plt.ylabel("1NN Cluster ID")
-    plt.xticks(ticks=range(config.K), labels=sorted_labels)
-    plt.yticks(ticks=range(config.K), labels=sorted_labels)
-    plt.grid(False)
-    plt.show()
-    ### ENDWIP
-
-    ### WIP: only animating the cluster centers, baking offsets
-    # TODO: Transform rotation around the center instead of just translation.
-    if False:
-        for c in range(clustering.num_clusters):
-            mask = clustering.masks[c]
-            # 1) get transformation relative to cluster center, 
-            # 2) rotate into cluster coordinate system, 
-            # 3) mean over time
-            # 4) reproject to world
-            
-            # positions are now in cluster-centered world-aligned coordinates
-            features.pos[:,mask] = features.pos[:,mask] - clustering.centers[:,c].unsqueeze(1)
-        
-            for t in range(features.T):
-                R_wtoc = R.from_quat(clustering.transformations[t,c,[4,5,6,3]]
-                                            .cpu()
-                                            .numpy()).inv()
-                
-                # positions are now in cluster-centered cluster-aligned coordinates
-                features.pos[t,mask] = \
-                    torch.from_numpy((R_wtoc
-                                            .apply(features.pos[t,mask]
-                                                        .cpu()
-                                                        .numpy())))\
-                        .float()\
-                        .to("cuda")
-                
-                # rotations are now w.r.t. cluster axes
-                features.rot[t,mask] = \
-                    torch.from_numpy((R_wtoc * 
-                                    (R.from_quat(features.rot[...,[1,2,3,0]][t,mask]
-                                                        .reshape((-1,4))
-                                                        .cpu()
-                                                        .numpy())))
-                                    .as_quat())\
-                        .float()\
-                        .to("cuda") # leave in xyzw format for now
-            
-            # each gaussian positions/rotations is now averaged over time w.r.t. the cluster coordinates
-            features.pos[:,mask] = features.pos[:,mask].mean(dim=0, keepdim=True) 
-            features.rot[:,mask] = features.rot[:,mask].mean(dim=0, keepdim=True)
-
-            # transform back to world
-            for t in range(features.T):
-                R_ctow = R.from_quat(clustering.transformations[t,c,[4,5,6,3]]
-                                            .cpu()
-                                            .numpy())
-
-                features.pos[t,mask] = clustering.centers[t,c] + \
-                    torch.from_numpy(R_ctow.apply(features.pos[t,mask]
-                                                        .reshape((-1,3))
-                                                        .cpu()
-                                                        .numpy()))\
-                        .float()\
-                        .to("cuda")
-
-                features.rot[t,mask] = \
-                    torch.from_numpy((R_ctow * 
-                                    R.from_quat(features.rot[...,[1,2,3,0]][t,mask].cpu().numpy()))
-                                    .as_quat())\
-                        .float()\
-                        .to("cuda")[...,[3,0,1,2]] # convert to wxyz format
-    ### ENDWIP
-
-    # Pass into Grig eventually
-    # Grig(...)
+    if USE_CLUSTER_TRANSFORMS: __make_clusters_rigid(clustering, features)
 
     print(F"Coloring Gaussians (Mode={config.color_mode})")
     cmap = cm.get_cmap('turbo', config.K)
@@ -258,12 +159,96 @@ def solve(filepath_npz: str, config: Config, save_path: str = None) -> Tuple[Dic
             rendervar = {k: v[features.is_fg] for k, v in rendervar.items()}  
         scene_data.append(rendervar)
 
-    # Save clustering if requested
     if save_path is not None:
         save_scene_and_clustering(scene_data, clustering, save_path)
 
     return scene_data, clustering
 
+#@GPT
+def __quaternion_to_rotation_matrix(quat : torch.Tensor):
+    """
+    Convert a quaternion (w, x, y, z) to a rotation matrix.
+    quat: Tensor of shape (..., 4), where the last dimension is (w, x, y, z)
+    """
+    w, x, y, z = quat.unbind(dim=-1)
+    xx, yy, zz = x**2, y**2, z**2
+    xy, xz, yz = x*y, x*z, y*z
+    wx, wy, wz = w*x, w*y, w*z
+
+    return torch.stack([
+        [1 - 2*(yy + zz), 2*(xy - wz),     2*(xz + wy)],
+        [2*(xy + wz),     1 - 2*(xx + zz), 2*(yz - wx)],
+        [2*(xz - wy),     2*(yz + wx),     1 - 2*(xx + yy)]
+    ], dim=-1)
+
+#@GPT
+def __make_clusters_rigid(clustering : Clustering, features : Features):
+    """
+    Mutate features such that position and rotation are a fixed transform from the cluster center.
+    """
+    if USE_CLUSTER_TRANSFORMS:
+        for c in range(clustering.num_clusters):
+            mask = clustering.masks[c]
+
+            # Translate positions to cluster-centered coordinates
+            features.pos[:, mask] -= clustering.center_pos[:, c].unsqueeze(1)
+
+            for t in range(features.T):
+                quat_wtoc = clustering.transformations[t, c, [3, 4, 5, 6]]  # wxyz format
+                R_wtoc = __quaternion_to_rotation_matrix(quat_wtoc)
+
+                # Rotate positions and rotations into cluster-aligned coordinates
+                features.pos[t, mask] = __rotate_points(features.pos[t, mask], R_wtoc)
+
+                quat_features = features.rot[t, mask]  # xyzw format
+                quat_features = torch.cat([quat_features[..., 3:], quat_features[..., :3]], dim=-1)  # xyzw to wxyz
+
+                features.rot[t, mask] = (
+                    __quaternion_to_rotation_matrix(R_wtoc).matmul(quat_features.unsqueeze(-1)).squeeze(-1)
+                )
+
+            # Average over time in cluster coordinates
+            features.pos[:, mask] = features.pos[:, mask].mean(dim=0, keepdim=True)
+            features.rot[:, mask] = features.rot[:, mask].mean(dim=0, keepdim=True)
+
+            # Transform back to world coordinates
+            for t in range(features.T):
+                quat_ctow = clustering.transformations[t, c, [3, 4, 5, 6]]  # wxyz format
+                R_ctow = __quaternion_to_rotation_matrix(quat_ctow)
+
+                features.pos[t, mask] = clustering.centers[t, c] + __rotate_points(features.pos[t, mask], R_ctow)
+
+                quat_features = features.rot[t, mask]
+                features.rot[t, mask] = R_ctow.matmul(quat_features.unsqueeze(-1)).squeeze(-1)
+
+#@GPT 
+def __rotate_points(points : torch.Tensor, rotation_matrix : torch.Tensor):
+    """
+    Apply a rotation matrix to a set of points.
+    points: Tensor of shape (N, 3)
+    rotation_matrix: Tensor of shape (3, 3) or (N, 3, 3)
+    """
+    return torch.einsum("nij,nj->ni", rotation_matrix, points)
+
+def __analyze_cluster_pairs(np_fg_features, cluster_center_features):
+    distances = pairwise_distances(np_fg_features, cluster_center_features)
+    sorted_clusters = distances.argsort(axis=1)  # (N, K)
+
+    _1NN_ids = sorted_clusters[:, 0]
+    _2NN_ids = sorted_clusters[:, 1]
+
+    matrix = np.zeros((config.K, config.K), dtype=int)
+    for i, j in zip(_1NN_ids, _2NN_ids):
+        matrix[i, j] += 1
+
+    plt.figure(figsize=(8, 6))
+    plt.imshow(matrix, cmap='viridis', origin='upper')
+    plt.colorbar(label="Count")
+    plt.title("2D Matrix of 1NN and 2NN Counts")
+    plt.xlabel("2NN Cluster ID")
+    plt.ylabel("1NN Cluster ID")
+    plt.grid(False)
+    plt.show()
 
 def initialize_cluster_center_dots(clustering, vis) -> List[o3d.geometry.TriangleMesh]:
     """Initializes the memory for the center dots visualization."""
@@ -277,7 +262,7 @@ def initialize_cluster_center_dots(clustering, vis) -> List[o3d.geometry.Triangl
 
 def update_cluster_centers(t:int, clustering:Clustering, w2c:np.ndarray, cluster_center_dots:List[o3d.geometry.TriangleMesh], vis:o3d.visualization.Visualizer):
     """Updates the center dots visualization to timestep `t`."""
-    centers_t = clustering.centers[t].cpu()
+    centers_t = clustering.center_pos[t].cpu()
     
     # NOTE: we project closer to the camera to be visible as an overlay
     __new_cluster_center_points = torch.cat([centers_t,torch.ones((clustering.num_clusters,1))],dim=-1) # (K,4)
@@ -326,7 +311,7 @@ def load_scene_and_clustering(filepath: str) -> Tuple[List[Dict[str, torch.Tenso
 
 def find_nearest_neighbor_chains_all_timesteps(clustering: Clustering, max_distance: float = 0.5) -> List[List[int]]:
     """ Find chains of clusters by considering all timesteps to determine the best adjacent cluster pairs. """
-    centers_t = clustering.centers.cpu().numpy()       # (T, K, 3)
+    centers_t = clustering.center_pos.cpu().numpy()       # (T, K, 3)
     dpos_t = clustering.center_dpos.cpu().numpy()      # (T, K, 3)
     drot_t = clustering.center_drot.cpu().numpy()      # (T, K, 3)
     
@@ -395,7 +380,7 @@ def find_nearest_neighbor_chains_all_timesteps(clustering: Clustering, max_dista
 
 def compute_joints(clustering: Clustering, cluster_chains: List[List[int]]) -> np.ndarray:
     """ Computes the joint positions as the midpoint between consecutive clusters in each chain."""
-    centers_t = clustering.centers.cpu().numpy()  # (T, K, 3)
+    centers_t = clustering.center_pos.cpu().numpy()  # (T, K, 3)
     num_timesteps = centers_t.shape[0]
 
     # Compute the number of joints based on consecutive pairs in chains
@@ -449,7 +434,7 @@ def update_joints(t: int, joints_t: np.ndarray, joint_dots: List[o3d.geometry.Tr
 #@GPT
 def update_lineset(t:int, clustering:Clustering, w2c:np.ndarray, xform_lineset:o3d.geometry.LineSet, vis:o3d.visualization.Visualizer):
     """Updates the xform lineset visualization to timestep `t`."""
-    centers_t = clustering.centers[t]  # Assuming you have access to this
+    centers_t = clustering.center_pos[t]  # Assuming you have access to this
     xforms_t = clustering.transformations[t]  # Get transformations for this time step
 
     new_cluster_center_xform_points = np.zeros((4 * clustering.num_clusters, 3))  # 4 points per cluster
