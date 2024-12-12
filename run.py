@@ -76,15 +76,15 @@ def solve(filepath_npz: str, config: Config, save_path: str = None) -> Tuple[Dic
     np_fg_labels = kmeans.labels_
     np_fg_feature_means = kmeans.cluster_centers_
     torch_fg_labels = torch.from_numpy(np_fg_labels).long()  # Needs to be on CPU for apply_
-
+    
     # sort based on cluster population
     label_counts = torch.bincount(torch_fg_labels, minlength=config.K)
     __sort_order = np.argsort(-label_counts.numpy())  # Descending order of cluster sizes
-    __relable_fn = {old_label: new_label for new_label, old_label in enumerate(__sort_order)}.get
+    __relabeling_fn = {old_label: new_label for new_label, old_label in enumerate(__sort_order)}.get
     
     # map labels
-    torch_fg_labels.apply_(__relable_fn)
-    np_fg_labels = np.array([__relable_fn(label) for label in np_fg_labels], dtype=int)
+    torch_fg_labels.apply_(__relabeling_fn)
+    np_fg_labels = np.array([__relabeling_fn(label) for label in np_fg_labels], dtype=int)
     np_fg_feature_means = np_fg_feature_means[__sort_order]
 
     clustering = Clustering(
@@ -93,7 +93,6 @@ def solve(filepath_npz: str, config: Config, save_path: str = None) -> Tuple[Dic
         torch_fg_labels
         #torch.from_numpy(np_feature_means).to("cuda")
     )
-
     if USE_CLUSTER_TRANSFORMS: __make_clusters_rigid(clustering, features)
 
     print(F"Coloring Gaussians (Mode={config.color_mode})")
@@ -232,7 +231,7 @@ def __make_clusters_rigid(clustering : Clustering, features : Features):
                 quat_ctow = clustering.transformations[t, c, [3, 4, 5, 6]]  # wxyz format
                 R_ctow = __quaternion_to_rotation_matrix(quat_ctow)
 
-                features.pos[t, mask] = clustering.centers[t, c] + __rotate_points(features.pos[t, mask], R_ctow)
+                features.pos[t, mask] = clustering.center_pos[t, c] + __rotate_points(features.pos[t, mask], R_ctow)
 
                 quat_features = features.rot[t, mask]
                 features.rot[t, mask] = R_ctow.matmul(quat_features.unsqueeze(-1)).squeeze(-1)
@@ -246,6 +245,7 @@ def __rotate_points(points : torch.Tensor, rotation_matrix : torch.Tensor):
     """
     return torch.einsum("nij,nj->ni", rotation_matrix, points)
 
+import threading
 def __analyze_cluster_pairs(masks, np_fg_features, np_fg_feature_means):
     distances = pairwise_distances(np_fg_features, np_fg_feature_means)
     sorted_clusters = distances.argsort(axis=1)
@@ -261,17 +261,47 @@ def __analyze_cluster_pairs(masks, np_fg_features, np_fg_feature_means):
         if mask_sum > 0:
             matrix[i] /= mask_sum
 
-    plt.figure(figsize=(16, 6))
+    def plot():
+        plt.figure(figsize=(6, 6))
 
-    plt.subplot(1, 2, 1)
-    plt.imshow(matrix, origin='upper')
-    plt.title("Asymmetric Normalized 2D Matrix of 1NN and 2NN Counts")
-    plt.xlabel("2NN Cluster ID")
-    plt.ylabel("1NN Cluster ID")
-    plt.grid(False)
+        plt.subplot(1, 2, 1)
+        plt.imshow(matrix, origin='upper')
+        plt.title("Asymmetric Normalized 2D Matrix of 1NN and 2NN Counts")
+        plt.xlabel("2NN Cluster ID")
+        plt.ylabel("1NN Cluster ID")
+        plt.grid(False)
 
-    plt.tight_layout()
-    plt.show()
+        plt.tight_layout()
+        plt.show()
+
+    # Run plotting in a separate thread
+    threading.Thread(target=plot).start()
+
+
+def initialize_cluster_center_dots(clustering:Clustering, vis:o3d.visualization.Visualizer) -> List[o3d.geometry.TriangleMesh]:
+    """Initializes the memory for the center dots visualization."""
+    cluster_center_dots = []
+    for _ in range(clustering.num_clusters):
+        center = o3d.geometry.TriangleMesh.create_sphere(radius=0.003) 
+        center.paint_uniform_color([1, 1, 1])   
+        cluster_center_dots.append(center)
+        vis.add_geometry(center)
+
+    return cluster_center_dots
+
+def update_cluster_centers(t:int, clustering:Clustering, w2c:np.ndarray, cluster_center_dots:List[o3d.geometry.TriangleMesh], vis:o3d.visualization.Visualizer):
+    """Updates the center dots visualization to timestep `t`."""
+    centers_t = clustering.center_pos[t].cpu()
+
+    # NOTE: we project closer to the camera to be visible as an overlay
+    __new_cluster_center_points = torch.cat([centers_t,torch.ones((clustering.num_clusters,1))],dim=-1) # (K,4)
+    __new_cluster_center_points = __new_cluster_center_points.numpy() @ w2c.T
+    __new_cluster_center_points[:,:3] *= 0.25
+    __new_cluster_center_points = __new_cluster_center_points @ np.linalg.inv(w2c).T
+    
+    for c in range(clustering.num_clusters):
+        cluster_center_dots[c].translate(__new_cluster_center_points[c,:3], relative=False)
+        vis.update_geometry(cluster_center_dots[c])
 
 def initialize_xform_lineset(clustering:Clustering, vis:o3d.visualization.Visualizer) -> o3d.geometry.LineSet:
     """Initializes the lineset for the xform visualization."""
@@ -291,6 +321,53 @@ def initialize_xform_lineset(clustering:Clustering, vis:o3d.visualization.Visual
     lineset.colors = o3d.utility.Vector3dVector(cluster_center_xform_colors)
     vis.add_geometry(lineset)
     return lineset
+
+#@GPT
+def update_lineset(t:int, clustering:Clustering, w2c:np.ndarray, xform_lineset:o3d.geometry.LineSet, vis:o3d.visualization.Visualizer):
+    """Updates the xform lineset visualization to timestep `t`."""
+    centers_t = clustering.center_pos[t].cpu()  # Assuming you have access to this
+    xforms_t = clustering.transformations[t].cpu()  # Get transformations for this time step
+
+    new_cluster_center_xform_points = np.zeros((4 * clustering.num_clusters, 3))  # 4 points per cluster
+
+    for c in range(clustering.num_clusters):
+        # Extract the origin (translation) for cluster `c`
+        origin = centers_t[c].numpy()
+
+        # Extract the rotation as a quaternion [qw, qx, qy, qz]
+        quaternion = xforms_t[c, 3:7].numpy()  # Extract [qw, qx, qy, qz]
+        
+        # Create a Rotation object from the quaternion (note the order for SciPy)
+        rotation = R.from_quat(quaternion[[1, 2, 3, 0]])  # [qx, qy, qz, qw]
+        
+        # Define unit vectors for local X, Y, Z axes in the cluster's local frame
+        local_x = np.array([0.2, 0, 0])  # X-axis unit vector scaled for visibility
+        local_y = np.array([0, 0.2, 0])  # Y-axis unit vector
+        local_z = np.array([0, 0, 0.2])  # Z-axis unit vector
+        
+        # Rotate the unit vectors from local cluster frame to world coordinates
+        world_x = rotation.apply(local_x)  # Rotate the X-axis unit vector
+        world_y = rotation.apply(local_y)  # Rotate the Y-axis unit vector
+        world_z = rotation.apply(local_z)  # Rotate the Z-axis unit vector
+
+        # Set the new points in world space
+        new_cluster_center_xform_points[4 * c] = origin  # Cluster center
+        new_cluster_center_xform_points[4 * c + 1] = origin + world_x  # X-axis in world coordinates
+        new_cluster_center_xform_points[4 * c + 2] = origin + world_y  # Y-axis in world coordinates
+        new_cluster_center_xform_points[4 * c + 3] = origin + world_z  # Z-axis in world coordinates
+
+    # Projection: project the points closer to the camera to ensure visibility
+    homogeneous_points = np.hstack([new_cluster_center_xform_points, np.ones((4 * clustering.num_clusters, 1))])  # Add homogeneous coord
+    projected_points = homogeneous_points @ w2c.T  # Apply world-to-camera transformation
+    projected_points[:, :3] *= 0.25  # Scale points down to move closer to the camera
+    projected_points = projected_points @ np.linalg.inv(w2c).T  # Reproject back to world coordinates
+    new_cluster_center_xform_points = projected_points[:, :3]  # Extract 3D coordinates
+
+    # Update the LineSet points
+    xform_lineset.points = o3d.utility.Vector3dVector(new_cluster_center_xform_points)
+    
+    # Update the visualization
+    vis.update_geometry(xform_lineset)
 
 def save_scene_and_clustering(scene_data: List[Dict[str, torch.Tensor]], 
                               clustering: Clustering, 
@@ -405,30 +482,6 @@ def compute_joints(clustering: Clustering, cluster_chains: List[List[int]]) -> n
     print(f"Computed {num_joints} joints.")
     return joints_t
 
-def initialize_cluster_center_dots(clustering, vis) -> List[o3d.geometry.TriangleMesh]:
-    """Initializes the memory for the center dots visualization."""
-    cluster_center_dots = []
-    for _ in range(clustering.num_clusters):
-        center = o3d.geometry.TriangleMesh.create_sphere(radius=0.005) 
-        center.paint_uniform_color([1, 1, 1])   
-        cluster_center_dots.append(center)
-        vis.add_geometry(center)
-    return cluster_center_dots
-
-def update_cluster_centers(t:int, clustering:Clustering, w2c:np.ndarray, cluster_center_dots:List[o3d.geometry.TriangleMesh], vis:o3d.visualization.Visualizer):
-    """Updates the center dots visualization to timestep `t`."""
-    centers_t = clustering.center_pos[t].cpu()
-    
-    # NOTE: we project closer to the camera to be visible as an overlay
-    __new_cluster_center_points = torch.cat([centers_t,torch.ones((clustering.num_clusters,1))],dim=-1) # (K,4)
-    __new_cluster_center_points = __new_cluster_center_points.cpu().numpy() @ w2c.T
-    __new_cluster_center_points[:,:3] *= 0.25
-    __new_cluster_center_points = __new_cluster_center_points @ np.linalg.inv(w2c).T
-    
-    for c in range(clustering.num_clusters):
-        cluster_center_dots[c].translate(__new_cluster_center_points[c,:3], relative=False)
-        vis.update_geometry(cluster_center_dots[c])
-
 def initialize_joint_dots(joints: np.ndarray, vis: o3d.visualization.Visualizer) -> List[o3d.geometry.TriangleMesh]:
     """ Initializes the memory for the joint dots visualization. """
     joint_dots = []
@@ -458,53 +511,6 @@ def update_joints(t: int, joints_t: np.ndarray, joint_dots: List[o3d.geometry.Tr
         joint.translate(__new_joint_points[idx, :3], relative=False)
         vis.update_geometry(joint)
 
-#@GPT
-def update_lineset(t:int, clustering:Clustering, w2c:np.ndarray, xform_lineset:o3d.geometry.LineSet, vis:o3d.visualization.Visualizer):
-    """Updates the xform lineset visualization to timestep `t`."""
-    centers_t = clustering.center_pos[t]  # Assuming you have access to this
-    xforms_t = clustering.transformations[t]  # Get transformations for this time step
-
-    new_cluster_center_xform_points = np.zeros((4 * clustering.num_clusters, 3))  # 4 points per cluster
-
-    for c in range(clustering.num_clusters):
-        # Extract the origin (translation) for cluster `c`
-        origin = centers_t[c].cpu().numpy()
-
-        # Extract the rotation as a quaternion [qw, qx, qy, qz]
-        quaternion = xforms_t[c, 3:7].cpu().numpy()  # Extract [qw, qx, qy, qz]
-        
-        # Create a Rotation object from the quaternion (note the order for SciPy)
-        rotation = R.from_quat(quaternion[[1, 2, 3, 0]])  # [qx, qy, qz, qw]
-        
-        # Define unit vectors for local X, Y, Z axes in the cluster's local frame
-        local_x = np.array([0.2, 0, 0])  # X-axis unit vector scaled for visibility
-        local_y = np.array([0, 0.2, 0])  # Y-axis unit vector
-        local_z = np.array([0, 0, 0.2])  # Z-axis unit vector
-        
-        # Rotate the unit vectors from local cluster frame to world coordinates
-        world_x = rotation.apply(local_x)  # Rotate the X-axis unit vector
-        world_y = rotation.apply(local_y)  # Rotate the Y-axis unit vector
-        world_z = rotation.apply(local_z)  # Rotate the Z-axis unit vector
-
-        # Set the new points in world space
-        new_cluster_center_xform_points[4 * c] = origin  # Cluster center
-        new_cluster_center_xform_points[4 * c + 1] = origin + world_x  # X-axis in world coordinates
-        new_cluster_center_xform_points[4 * c + 2] = origin + world_y  # Y-axis in world coordinates
-        new_cluster_center_xform_points[4 * c + 3] = origin + world_z  # Z-axis in world coordinates
-
-    # Projection: project the points closer to the camera to ensure visibility
-    homogeneous_points = np.hstack([new_cluster_center_xform_points, np.ones((4 * clustering.num_clusters, 1))])  # Add homogeneous coord
-    projected_points = homogeneous_points @ w2c.T  # Apply world-to-camera transformation
-    projected_points[:, :3] *= 0.25  # Scale points down to move closer to the camera
-    projected_points = projected_points @ np.linalg.inv(w2c).T  # Reproject back to world coordinates
-    new_cluster_center_xform_points = projected_points[:, :3]  # Extract 3D coordinates
-
-    # Update the LineSet points
-    xform_lineset.points = o3d.utility.Vector3dVector(new_cluster_center_xform_points)
-    
-    # Update the visualization
-    vis.update_geometry(xform_lineset)
-
 def main(filepath_npz: str, config: Config, clustering_filepath: str = "clustering.npz" , save_path: str = "clustering.npz"):
     joint = False
     if clustering_filepath is not None and os.path.exists("./"+clustering_filepath):
@@ -514,8 +520,7 @@ def main(filepath_npz: str, config: Config, clustering_filepath: str = "clusteri
         print("Running clustering algorithm.")
         scene_data, clustering, miscellaneous = solve(filepath_npz, config, save_path=save_path)
 
-    #__analyze_cluster_pairs(clustering.masks, miscellaneous['np_fg_features'], miscellaneous['np_fg_feature_means'])
-    # exit()
+    __analyze_cluster_pairs(clustering.masks, miscellaneous['np_fg_features'], miscellaneous['np_fg_feature_means'])
 
     vis = o3d.visualization.Visualizer()
     vis.create_window(width=int(w * view_scale), height=int(h * view_scale), visible=True)

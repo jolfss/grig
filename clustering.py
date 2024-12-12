@@ -49,9 +49,9 @@ class Clustering:
         for c in range(num_clusters):
             mask = (self.labels==c)
             self.masks[c,:] = mask
-            self.center_pos[:,c,:] = (features.pos * mask.unsqueeze(-1)).sum(dim=1) / min(mask.sum(),1) 
+            self.center_pos[:,c,:] = (features.pos * mask.unsqueeze(-1)).sum(dim=1) / max(mask.sum(),1) 
             self.transformations[:,c,:] = (torch.cat((features.pos,features.rot),dim=-1) * mask.unsqueeze(-1)).sum(dim=1) / mask.sum() 
-
+        
         # assert masks are disjoint and cover
         total = 0
         for i in range(num_clusters):
