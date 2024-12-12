@@ -9,7 +9,7 @@ class Clustering:
     """The number of clusters in this clustering."""
 
     labels : torch.Tensor
-    """The cluster ids/labels of the gaussians; indices are assigned starting with the most populated cluster, so index
+    """The cluster ids/labels of the gaussians; requires indices are assigned starting with the most populated cluster, so index
     0 is the most populated and K-1 is the least. Labels are `[0,num_clusters)` if in a cluster or `-1` if background.
     `(N,)@cuda long`"""
 
@@ -38,14 +38,10 @@ class Clustering:
         TODO: docs
         """
 
-        # permute labels s.t. first indices correspond to most populous clusters
-        labels.apply_({old_label: new_label for new_label, old_label 
-                       in enumerate(np.argsort(-torch.bincount(labels, minlength=num_clusters)))}.get)
-
         self.num_clusters = num_clusters
         
         self.labels = torch.zeros((features.N),device="cuda").long() - 1
-        self.labels[features.is_fg] = labels
+        self.labels[features.is_fg] = labels.to("cuda")
 
         self.masks = torch.zeros((num_clusters, features.N), device="cuda", dtype=torch.bool)
         self.center_pos = torch.zeros((features.T, num_clusters, 3), device="cuda")

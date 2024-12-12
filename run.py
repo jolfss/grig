@@ -8,11 +8,12 @@ import torch
 import numpy as np
 
 # our imports
+import os
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 from scipy.spatial.transform import Rotation as R  # To handle quaternion-based rotations
 from sklearn.neighbors import KDTree
 from sklearn.metrics import pairwise_distances
@@ -49,9 +50,9 @@ fps = 15
 #   methods   #
 #-------------#
 @torch.no_grad()
-def solve(filepath_npz: str, config: Config, save_path: str = None) -> Tuple[Dict[str, torch.Tensor], Clustering]:
+def solve(filepath_npz: str, config: Config, save_path: str = None) -> Tuple[Dict[str, torch.Tensor], Clustering, Dict[str,Any]]:
     """
-    The clustering algorithm `(param_filepath, config) -> (scene_data, clustering)`. 
+    The clustering algorithm `(param_filepath, config) -> (scene_data, clustering, miscellaneous)`. 
     """
     
     print(F"Opening {filepath_npz}")
@@ -73,15 +74,25 @@ def solve(filepath_npz: str, config: Config, save_path: str = None) -> Tuple[Dic
     kmeans = KMeans(n_clusters=config.K)
     kmeans.fit(np_fg_features)
     np_fg_labels = kmeans.labels_
-    np_feature_means = kmeans.cluster_centers_
+    np_fg_feature_means = kmeans.cluster_centers_
+    torch_fg_labels = torch.from_numpy(np_fg_labels).long()  # Needs to be on CPU for apply_
+
+    # sort based on cluster population
+    label_counts = torch.bincount(torch_fg_labels, minlength=config.K)
+    __sort_order = np.argsort(-label_counts.numpy())  # Descending order of cluster sizes
+    __relable_fn = {old_label: new_label for new_label, old_label in enumerate(__sort_order)}.get
+    
+    # map labels
+    torch_fg_labels.apply_(__relable_fn)
+    np_fg_labels = np.array([__relable_fn(label) for label in np_fg_labels], dtype=int)
+    np_fg_feature_means = np_fg_feature_means[__sort_order]
 
     clustering = Clustering(
         config.K,
         features,
-        torch.from_numpy(np_feature_means).long().to("cuda")
+        torch_fg_labels
+        #torch.from_numpy(np_feature_means).to("cuda")
     )
-
-    __analyze_cluster_pairs(np_fg_features, np_feature_means)
 
     if USE_CLUSTER_TRANSFORMS: __make_clusters_rigid(clustering, features)
 
@@ -160,9 +171,14 @@ def solve(filepath_npz: str, config: Config, save_path: str = None) -> Tuple[Dic
         scene_data.append(rendervar)
 
     if save_path is not None:
-        save_scene_and_clustering(scene_data, clustering, save_path)
+        save_scene_and_clustering(
+            scene_data, clustering, save_path, 
+            # optional kwargs
+            np_fg_features=np_fg_features,
+            np_fg_feature_means=np_fg_feature_means,
+        )
 
-    return scene_data, clustering
+    return scene_data, clustering, {'np_fg_features':np_fg_features,'np_fg_feature_means':np_fg_feature_means}
 
 #@GPT
 def __quaternion_to_rotation_matrix(quat : torch.Tensor):
@@ -230,49 +246,32 @@ def __rotate_points(points : torch.Tensor, rotation_matrix : torch.Tensor):
     """
     return torch.einsum("nij,nj->ni", rotation_matrix, points)
 
-def __analyze_cluster_pairs(np_fg_features, cluster_center_features):
-    distances = pairwise_distances(np_fg_features, cluster_center_features)
-    sorted_clusters = distances.argsort(axis=1)  # (N, K)
-
+def __analyze_cluster_pairs(masks, np_fg_features, np_fg_feature_means):
+    distances = pairwise_distances(np_fg_features, np_fg_feature_means)
+    sorted_clusters = distances.argsort(axis=1)
     _1NN_ids = sorted_clusters[:, 0]
     _2NN_ids = sorted_clusters[:, 1]
 
-    matrix = np.zeros((config.K, config.K), dtype=int)
+    matrix = np.zeros((config.K, config.K), dtype=float)
     for i, j in zip(_1NN_ids, _2NN_ids):
         matrix[i, j] += 1
+    
+    for i in np.unique(_1NN_ids):  
+        mask_sum = torch.sum(masks[i]).item()
+        if mask_sum > 0:
+            matrix[i] /= mask_sum
 
-    plt.figure(figsize=(8, 6))
-    plt.imshow(matrix, cmap='viridis', origin='upper')
-    plt.colorbar(label="Count")
-    plt.title("2D Matrix of 1NN and 2NN Counts")
+    plt.figure(figsize=(16, 6))
+
+    plt.subplot(1, 2, 1)
+    plt.imshow(matrix, origin='upper')
+    plt.title("Asymmetric Normalized 2D Matrix of 1NN and 2NN Counts")
     plt.xlabel("2NN Cluster ID")
     plt.ylabel("1NN Cluster ID")
     plt.grid(False)
+
+    plt.tight_layout()
     plt.show()
-
-def initialize_cluster_center_dots(clustering, vis) -> List[o3d.geometry.TriangleMesh]:
-    """Initializes the memory for the center dots visualization."""
-    cluster_center_dots = []
-    for _ in range(clustering.num_clusters):
-        center = o3d.geometry.TriangleMesh.create_sphere(radius=0.005) 
-        center.paint_uniform_color([1, 1, 1])   
-        cluster_center_dots.append(center)
-        vis.add_geometry(center)
-    return cluster_center_dots
-
-def update_cluster_centers(t:int, clustering:Clustering, w2c:np.ndarray, cluster_center_dots:List[o3d.geometry.TriangleMesh], vis:o3d.visualization.Visualizer):
-    """Updates the center dots visualization to timestep `t`."""
-    centers_t = clustering.center_pos[t].cpu()
-    
-    # NOTE: we project closer to the camera to be visible as an overlay
-    __new_cluster_center_points = torch.cat([centers_t,torch.ones((clustering.num_clusters,1))],dim=-1) # (K,4)
-    __new_cluster_center_points = __new_cluster_center_points.cpu().numpy() @ w2c.T
-    __new_cluster_center_points[:,:3] *= 0.25
-    __new_cluster_center_points = __new_cluster_center_points @ np.linalg.inv(w2c).T
-    
-    for c in range(clustering.num_clusters):
-        cluster_center_dots[c].translate(__new_cluster_center_points[c,:3], relative=False)
-        vis.update_geometry(cluster_center_dots[c])
 
 def initialize_xform_lineset(clustering:Clustering, vis:o3d.visualization.Visualizer) -> o3d.geometry.LineSet:
     """Initializes the lineset for the xform visualization."""
@@ -293,25 +292,30 @@ def initialize_xform_lineset(clustering:Clustering, vis:o3d.visualization.Visual
     vis.add_geometry(lineset)
     return lineset
 
-def save_scene_and_clustering(scene_data: List[Dict[str, torch.Tensor]], clustering: Clustering, filepath: str):
+def save_scene_and_clustering(scene_data: List[Dict[str, torch.Tensor]], 
+                              clustering: Clustering, 
+                              filepath: str,
+                              **miscellaneous):
     """ Saves scene_data and clustering information to a file. """
     data = {
         'scene_data': scene_data,
-        'clustering': clustering
+        'clustering': clustering,
+        'miscellaneous' : miscellaneous
     }
     torch.save(data, filepath)
 
-
-def load_scene_and_clustering(filepath: str) -> Tuple[List[Dict[str, torch.Tensor]], Clustering]:
+def load_scene_and_clustering(filepath: str) -> Tuple[List[Dict[str, torch.Tensor]], Clustering, Dict[str,Any]]:
     """ Loads scene_data and clustering information from a file. """
     data = torch.load(filepath)
     scene_data = data['scene_data']
     clustering = data['clustering']
-    return scene_data, clustering
+    miscellaneous = data['miscellaneous']
+    
+    return scene_data, clustering, miscellaneous
 
 def find_nearest_neighbor_chains_all_timesteps(clustering: Clustering, max_distance: float = 0.5) -> List[List[int]]:
     """ Find chains of clusters by considering all timesteps to determine the best adjacent cluster pairs. """
-    centers_t = clustering.center_pos.cpu().numpy()       # (T, K, 3)
+    centers_t = clustering.center_pos.cpu().numpy()    # (T, K, 3)
     dpos_t = clustering.center_dpos.cpu().numpy()      # (T, K, 3)
     drot_t = clustering.center_drot.cpu().numpy()      # (T, K, 3)
     
@@ -401,6 +405,30 @@ def compute_joints(clustering: Clustering, cluster_chains: List[List[int]]) -> n
     print(f"Computed {num_joints} joints.")
     return joints_t
 
+def initialize_cluster_center_dots(clustering, vis) -> List[o3d.geometry.TriangleMesh]:
+    """Initializes the memory for the center dots visualization."""
+    cluster_center_dots = []
+    for _ in range(clustering.num_clusters):
+        center = o3d.geometry.TriangleMesh.create_sphere(radius=0.005) 
+        center.paint_uniform_color([1, 1, 1])   
+        cluster_center_dots.append(center)
+        vis.add_geometry(center)
+    return cluster_center_dots
+
+def update_cluster_centers(t:int, clustering:Clustering, w2c:np.ndarray, cluster_center_dots:List[o3d.geometry.TriangleMesh], vis:o3d.visualization.Visualizer):
+    """Updates the center dots visualization to timestep `t`."""
+    centers_t = clustering.center_pos[t].cpu()
+    
+    # NOTE: we project closer to the camera to be visible as an overlay
+    __new_cluster_center_points = torch.cat([centers_t,torch.ones((clustering.num_clusters,1))],dim=-1) # (K,4)
+    __new_cluster_center_points = __new_cluster_center_points.cpu().numpy() @ w2c.T
+    __new_cluster_center_points[:,:3] *= 0.25
+    __new_cluster_center_points = __new_cluster_center_points @ np.linalg.inv(w2c).T
+    
+    for c in range(clustering.num_clusters):
+        cluster_center_dots[c].translate(__new_cluster_center_points[c,:3], relative=False)
+        vis.update_geometry(cluster_center_dots[c])
+
 def initialize_joint_dots(joints: np.ndarray, vis: o3d.visualization.Visualizer) -> List[o3d.geometry.TriangleMesh]:
     """ Initializes the memory for the joint dots visualization. """
     joint_dots = []
@@ -429,7 +457,6 @@ def update_joints(t: int, joints_t: np.ndarray, joint_dots: List[o3d.geometry.Tr
     for idx, joint in enumerate(joint_dots):
         joint.translate(__new_joint_points[idx, :3], relative=False)
         vis.update_geometry(joint)
-
 
 #@GPT
 def update_lineset(t:int, clustering:Clustering, w2c:np.ndarray, xform_lineset:o3d.geometry.LineSet, vis:o3d.visualization.Visualizer):
@@ -478,14 +505,17 @@ def update_lineset(t:int, clustering:Clustering, w2c:np.ndarray, xform_lineset:o
     # Update the visualization
     vis.update_geometry(xform_lineset)
 
-def main(filepath_npz: str, config: Config, clustering_filepath: str = None , save_path: str = "clustering.npz"):
+def main(filepath_npz: str, config: Config, clustering_filepath: str = "clustering.npz" , save_path: str = "clustering.npz"):
     joint = False
-    if clustering_filepath is not None:
+    if clustering_filepath is not None and os.path.exists("./"+clustering_filepath):
         print("Loading clustering from file.")
-        scene_data, clustering = load_scene_and_clustering(clustering_filepath)
+        scene_data, clustering, miscellaneous = load_scene_and_clustering(clustering_filepath)
     else:
         print("Running clustering algorithm.")
-        scene_data, clustering = solve(filepath_npz, config, save_path=save_path)
+        scene_data, clustering, miscellaneous = solve(filepath_npz, config, save_path=save_path)
+
+    #__analyze_cluster_pairs(clustering.masks, miscellaneous['np_fg_features'], miscellaneous['np_fg_feature_means'])
+    # exit()
 
     vis = o3d.visualization.Visualizer()
     vis.create_window(width=int(w * view_scale), height=int(h * view_scale), visible=True)
@@ -503,9 +533,8 @@ def main(filepath_npz: str, config: Config, clustering_filepath: str = None , sa
     pcd.colors = init_cols
     vis.add_geometry(pcd)
 
-    #cluster_center_dots = initialize_cluster_center_dots(clustering, vis)
-    #xform_lineset = initialize_xform_lineset(clustering, vis)
-
+    cluster_center_dots = initialize_cluster_center_dots(clustering, vis)
+    xform_lineset = initialize_xform_lineset(clustering, vis)
 
     #----------------------#
     #     Evan's Joint     #
@@ -559,8 +588,8 @@ def main(filepath_npz: str, config: Config, clustering_filepath: str = None , sa
         pcd.colors = cols
         vis.update_geometry(pcd)
 
-        #update_cluster_centers(t, clustering, w2c, cluster_center_dots, vis)
-        #update_lineset(t, clustering, w2c, xform_lineset, vis)
+        update_cluster_centers(t, clustering, w2c, cluster_center_dots, vis)
+        update_lineset(t, clustering, w2c, xform_lineset, vis)
 
         #----------------------#
         #     Evan's Joint     #

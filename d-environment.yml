@@ -1,4 +1,4 @@
-name: dynamic_gaussians
+name: dynamic_gaussians_1
 channels:
   - defaults
   - pytorch
