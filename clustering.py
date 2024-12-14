@@ -33,6 +33,7 @@ class Clustering:
     """The transformations of each cluster represented as [x,y,z,qw,qx,qy,qz].
     `(T,num_clusters,7)@cuda float`"""
 
+    @torch.no_grad()
     def __init__(self, num_clusters:int, features:Features, labels:torch.Tensor):
         """
         TODO: docs

@@ -13,17 +13,18 @@ import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 from scipy.spatial.transform import Rotation as R  # To handle quaternion-based rotations
 from sklearn.neighbors import KDTree
 from sklearn.metrics import pairwise_distances
 from sklearn.cluster import AgglomerativeClustering
+from sklearn_extra.cluster import KMedoids
 from dtaidistance import dtw
 from scipy.cluster.hierarchy import linkage, fcluster
 
 # types
 from parameters import Parameters
-from config import Config, BaseConfig, KMeansConfig
+from config import Config, KMeansConfig, KMedoidsConfig
 from features import Features
 from clustering import Clustering
 
@@ -63,19 +64,54 @@ def solve(filepath_npz: str, config: Config, save_path: str = None) -> Tuple[Dic
 
     print("Preparing Foreground Features")
     features = Features(params, config)
-    np_fg_features = features.features[features.is_fg].cpu().numpy()
+    np_fg_features : np.ndarray = features.features[features.is_fg].cpu().numpy()
 
-    if config.normalize_features:
-        print("Normalizing Foreground Features")
-        scaler = StandardScaler()
-        np_fg_features = scaler.fit_transform(np_fg_features)
+    def custom_dist(x,y):
+        """Combines linear and angular distance scalars into a single distance.
+        NOTE: Oddly, doesn't seem to work very well at all for angles."""
+        pos_dist=0
+        rot_dist=0
+        dpos_dist=0
+        drot_dist=0
 
-    print(F"Clustering Foreground Gaussians") 
-    kmeans = KMeans(n_clusters=config.K)
-    kmeans.fit(np_fg_features)
-    np_fg_labels = kmeans.labels_
-    np_fg_feature_means = kmeans.cluster_centers_
-    torch_fg_labels = torch.from_numpy(np_fg_labels).long()  # Needs to be on CPU for apply_
+        if features.pos_slice:
+            pos_dist =  np.linalg.norm(x[features.pos_slice] - y[features.pos_slice])
+        if features.rot_slice:
+            qrot1 = x[features.rot_slice]
+            qrot2 = y[features.rot_slice]
+            dot_product = np.dot(qrot1, qrot2)
+            dot_product = max(-1.0, min(1.0, dot_product))
+            rot_dist = 2 * np.arccos(abs(dot_product))
+        if features.dpos_slice:
+            dpos_dist = np.linalg.norm(x[features.dpos_slice]- y[features.dpos_slice])
+        if features.drot_slice:
+            qdrot1 = x[features.drot_slice]
+            qdrot2 = y[features.drot_slice]
+            dot_product = np.dot(qdrot1, qdrot2)
+            dot_product = max(-1.0, min(1.0, dot_product))
+            drot_dist = 2 * np.arccos(abs(dot_product))
+
+        return pos_dist + rot_dist + dpos_dist + drot_dist
+
+    if isinstance(config, KMeansConfig):
+        print(F"Clustering Foreground Gaussians")
+        kmeans = KMeans(n_clusters=config.K, n_init=1)
+        kmeans.fit(np_fg_features)
+        np_fg_labels = kmeans.labels_
+        np_fg_feature_means = kmeans.cluster_centers_
+        torch_fg_labels = torch.from_numpy(np_fg_labels).long()  # Needs to be on CPU for apply_
+    elif isinstance(config, KMedoidsConfig):
+        # TODO: implementation of KMedoids
+        print("Clustering Foreground Gaussians using KMedoids")
+        from sklearn_extra.cluster import CLARA
+        kmedoids = CLARA(n_clusters=config.K,n_sampling=config.sample_size, n_sampling_iter=config.samplings)#, metric=custom_dist)
+        kmedoids.fit(np_fg_features)
+        np_fg_labels = kmedoids.labels_
+        np_fg_feature_means = kmedoids.cluster_centers_
+        torch_fg_labels = torch.from_numpy(np_fg_labels).long()  # Needs to be on CPU for apply_
+    else:
+        print(F"Unsupported Config Type: {type(config), config}")
+        return
     
     # sort based on cluster population
     label_counts = torch.bincount(torch_fg_labels, minlength=config.K)
@@ -100,6 +136,8 @@ def solve(filepath_npz: str, config: Config, save_path: str = None) -> Tuple[Dic
     feature_colors = None
     if config.color_mode == "POS": # Color by magnitude of position
         feature_colors = torch.abs(features.pos[:,:,:3][:,features.is_fg]) #(T,N[is_fg],3)
+    if config.color_mode == "ROT": # Color by magnitude of quaternion xyz components 
+        feature_colors = torch.abs(features.rot[:,:,1:][:,features.is_fg]) #(T,N[is_fg],3)
     elif config.color_mode == "DPOS": # Color by magnitude of velocity
         feature_colors = torch.abs(features.dpos_dt[:,:,:3][:,features.is_fg]) #(T,N[is_fg],3)
     elif config.color_mode == "DROT": # Color by magnitude of angular velocity
@@ -246,7 +284,7 @@ def __rotate_points(points : torch.Tensor, rotation_matrix : torch.Tensor):
     return torch.einsum("nij,nj->ni", rotation_matrix, points)
 
 import threading
-def __analyze_cluster_pairs(masks, np_fg_features, np_fg_feature_means):
+def analyze_cluster_adjacency(masks, np_fg_features, np_fg_feature_means, show=False) -> np.ndarray :
     distances = pairwise_distances(np_fg_features, np_fg_feature_means)
     sorted_clusters = distances.argsort(axis=1)
     _1NN_ids = sorted_clusters[:, 0]
@@ -261,22 +299,54 @@ def __analyze_cluster_pairs(masks, np_fg_features, np_fg_feature_means):
         if mask_sum > 0:
             matrix[i] /= mask_sum
 
-    def plot():
-        plt.figure(figsize=(6, 6))
-
-        plt.subplot(1, 2, 1)
-        plt.imshow(matrix, origin='upper')
-        plt.title("Asymmetric Normalized 2D Matrix of 1NN and 2NN Counts")
-        plt.xlabel("2NN Cluster ID")
-        plt.ylabel("1NN Cluster ID")
-        plt.grid(False)
-
-        plt.tight_layout()
-        plt.show()
-
     # Run plotting in a separate thread
-    threading.Thread(target=plot).start()
+    if show:
+        def plot():
+            plt.figure(figsize=(6, 6))
+            plt.imshow(matrix, origin='upper',cmap='Greys_r')
+            plt.title("Asymmetric Normalized 2D Matrix of 1NN and 2NN Counts")
+            plt.xlabel("2NN Cluster ID")
+            plt.ylabel("1NN Cluster ID")
+            plt.grid(False)
 
+            plt.tight_layout()
+            plt.show()
+        threading.Thread(target=plot).start()
+    
+    return matrix
+
+import networkx as nx
+def initialize_adjacency_lineset(distance_matrix : np.ndarray, clustering:Clustering, vis:o3d.visualization.Visualizer, arborescence=False) -> o3d.geometry.LineSet:
+    weight_matrix = np.vectorize(lambda dist:1/max(dist,1e-16))(distance_matrix) 
+
+    adj = None
+    if arborescence:
+        adj = nx.minimum_spanning_arborescence(nx.from_numpy_matrix(weight_matrix, create_using=nx.DiGraph))
+    else:#mst
+        adj = nx.minimum_spanning_tree(nx.from_numpy_matrix(weight_matrix))
+
+    adj_lineset = o3d.geometry.LineSet()
+    adj_lines =  np.zeros((clustering.num_clusters-1,2))
+
+    for i,(u,v) in enumerate(adj.edges):
+        adj_lines[i]  = [u,v]
+
+    adj_lineset.lines = o3d.utility.Vector2iVector(adj_lines)
+    adj_lineset.paint_uniform_color([1,1,0])
+    vis.add_geometry(adj_lineset)
+    
+    return adj_lineset, adj
+    
+def update_adjacency_lineset(t:int, clustering:Clustering, w2c:np.ndarray, adj_lineset:o3d.geometry.LineSet, vis:o3d.visualization.Visualizer): 
+    """Updates the adjacency lineset visualization to timestep `t`."""
+    centers_t = clustering.center_pos[t].cpu()
+    __new_cluster_center_points = torch.cat([centers_t,torch.ones((clustering.num_clusters,1))],dim=-1)
+    __new_cluster_center_points = __new_cluster_center_points.numpy() @ w2c.T
+    __new_cluster_center_points[:,:3] *= 0.25
+    __new_cluster_center_points = __new_cluster_center_points @ np.linalg.inv(w2c).T
+    adj_lineset.points = o3d.utility.Vector3dVector(__new_cluster_center_points[:,:3])
+    adj_lineset.paint_uniform_color([1,1,0])
+    vis.update_geometry(adj_lineset)
 
 def initialize_cluster_center_dots(clustering:Clustering, vis:o3d.visualization.Visualizer) -> List[o3d.geometry.TriangleMesh]:
     """Initializes the memory for the center dots visualization."""
@@ -289,18 +359,50 @@ def initialize_cluster_center_dots(clustering:Clustering, vis:o3d.visualization.
 
     return cluster_center_dots
 
-def update_cluster_centers(t:int, clustering:Clustering, w2c:np.ndarray, cluster_center_dots:List[o3d.geometry.TriangleMesh], vis:o3d.visualization.Visualizer):
-    """Updates the center dots visualization to timestep `t`."""
+def update_cluster_centers(
+        t: int, clustering:Clustering, 
+        w2c: np.ndarray, 
+        cluster_center_dots: List[o3d.geometry.TriangleMesh], 
+        vis: o3d.visualization.Visualizer, 
+        graph: Optional[Union[nx.DiGraph,nx.Graph]] = None,
+):
+    """Updates the center dots visualization to timestep `t`, with optional coloring by depth in a DiGraph."""
     centers_t = clustering.center_pos[t].cpu()
 
-    # NOTE: we project closer to the camera to be visible as an overlay
-    __new_cluster_center_points = torch.cat([centers_t,torch.ones((clustering.num_clusters,1))],dim=-1) # (K,4)
+    # NOTE: project closer to the camera to be visible as an overlay
+    __new_cluster_center_points = torch.cat(
+        [centers_t, torch.ones((clustering.num_clusters, 1))], dim=-1
+    )  # (K,4)
     __new_cluster_center_points = __new_cluster_center_points.numpy() @ w2c.T
-    __new_cluster_center_points[:,:3] *= 0.25
+    __new_cluster_center_points[:, :3] *= 0.25
     __new_cluster_center_points = __new_cluster_center_points @ np.linalg.inv(w2c).T
-    
+
+    # Handle coloring by depth in the graph if `graph` is a DiGraph
+    colors = None
+    if type(graph) == nx.DiGraph:
+        # Compute depth for each node
+        root = [node for node, in_degree in graph.in_degree() if in_degree == 0]
+        if len(root) != 1:
+            raise ValueError("The graph must have exactly one root node.")
+        root = root[0]
+
+        depths = nx.single_source_shortest_path_length(graph, root)
+        max_depth = max(depths.values())
+
+        # Normalize depths for colormap
+        norm_depths = np.array([depths.get(i, max_depth + 1) for i in range(clustering.num_clusters)]) / max_depth
+        cmap = plt.cm.get_cmap("Greys")  # Choose a colormap
+        colors = cmap(norm_depths)[:, :3]  # Get RGB values (exclude alpha)
+
     for c in range(clustering.num_clusters):
-        cluster_center_dots[c].translate(__new_cluster_center_points[c,:3], relative=False)
+        cluster_center_dots[c].translate(
+            __new_cluster_center_points[c, :3], relative=False
+        )
+        
+        # Update color if `graph` is provided
+        if colors is not None:
+            cluster_center_dots[c].paint_uniform_color(colors[c])
+
         vis.update_geometry(cluster_center_dots[c])
 
 def initialize_xform_lineset(clustering:Clustering, vis:o3d.visualization.Visualizer) -> o3d.geometry.LineSet:
@@ -309,7 +411,7 @@ def initialize_xform_lineset(clustering:Clustering, vis:o3d.visualization.Visual
     cluster_center_xform_points = np.zeros((4*clustering.num_clusters,3)) # 4 points (center,->x,->y,->z) for each cluster
     cluster_center_xform_lines =  np.zeros((3*clustering.num_clusters,2)) # connect center to each unit vector
     cluster_center_xform_colors = np.zeros((3*clustering.num_clusters,3)) # r,g,b axis colorings
-    for c in range(config.K):
+    for c in range(clustering.num_clusters):
         cluster_center_xform_lines[3*c]   = [4*c, 4*c+1]
         cluster_center_xform_lines[3*c+1] = [4*c, 4*c+2]
         cluster_center_xform_lines[3*c+2] = [4*c, 4*c+3]
@@ -511,7 +613,8 @@ def update_joints(t: int, joints_t: np.ndarray, joint_dots: List[o3d.geometry.Tr
         joint.translate(__new_joint_points[idx, :3], relative=False)
         vis.update_geometry(joint)
 
-def main(filepath_npz: str, config: Config, clustering_filepath: str = "clustering.npz" , save_path: str = "clustering.npz"):
+@torch.no_grad()
+def main(filepath_npz: str, config: Config, clustering_filepath: str = None , save_path: str = None):
     joint = False
     if clustering_filepath is not None and os.path.exists("./"+clustering_filepath):
         print("Loading clustering from file.")
@@ -519,8 +622,6 @@ def main(filepath_npz: str, config: Config, clustering_filepath: str = "clusteri
     else:
         print("Running clustering algorithm.")
         scene_data, clustering, miscellaneous = solve(filepath_npz, config, save_path=save_path)
-
-    __analyze_cluster_pairs(clustering.masks, miscellaneous['np_fg_features'], miscellaneous['np_fg_feature_means'])
 
     vis = o3d.visualization.Visualizer()
     vis.create_window(width=int(w * view_scale), height=int(h * view_scale), visible=True)
@@ -539,7 +640,9 @@ def main(filepath_npz: str, config: Config, clustering_filepath: str = "clusteri
     vis.add_geometry(pcd)
 
     cluster_center_dots = initialize_cluster_center_dots(clustering, vis)
-    xform_lineset = initialize_xform_lineset(clustering, vis)
+    # xform_lineset = initialize_xform_lineset(clustering, vis)
+    cluster_adjacency_matrix = analyze_cluster_adjacency(clustering.masks, miscellaneous['np_fg_features'], miscellaneous['np_fg_feature_means'], show=config.show_adjacency)
+    adj_lineset, graph = initialize_adjacency_lineset(cluster_adjacency_matrix, clustering, vis, arborescence=config.arborescence)
 
     #----------------------#
     #     Evan's Joint     #
@@ -593,8 +696,9 @@ def main(filepath_npz: str, config: Config, clustering_filepath: str = "clusteri
         pcd.colors = cols
         vis.update_geometry(pcd)
 
-        update_cluster_centers(t, clustering, w2c, cluster_center_dots, vis)
-        update_lineset(t, clustering, w2c, xform_lineset, vis)
+        update_cluster_centers(t, clustering, w2c, cluster_center_dots, vis, graph)
+        # update_lineset(t, clustering, w2c, xform_lineset, vis)
+        update_adjacency_lineset(t, clustering, w2c, adj_lineset, vis)
 
         #----------------------#
         #     Evan's Joint     #
@@ -613,14 +717,34 @@ def main(filepath_npz: str, config: Config, clustering_filepath: str = "clusteri
 
 import sys
 if __name__ == "__main__":
-    config = KMeansConfig(
-        timestride=1,
-        POS=1,
-        DPOS=1,
-        DROT=1,
-        K=28,
-        remove_bg=True,
-        normalize_features=True,
-        color_mode=sys.argv[2]
-    )
+    base_config = {
+        "timestride":1,
+        "POS" :  64,      
+        "ROT" :  0, # ROT seems like a bad feature even though it contains some information
+        "DPOS":  1,
+        "DROT":  8,
+        "pre_normalize":True,
+        "remove_bg":True,
+        "color_mode":sys.argv[2],
+        "arborescence":True,
+        "show_adjacency":True,
+    }
+
+    K=26
+    if len(sys.argv) > 3:
+        if sys.argv[3] == "MEDOIDS":
+            config = KMedoidsConfig(
+                K=K, 
+                sample_size=2000,
+                samplings=5,
+                **base_config
+            )
+    else:
+        config = KMeansConfig(
+            K=K, 
+            **base_config
+        )
+    
+    print(F"Using config: {config}")
+
     main(F"./output/pretrained/{sys.argv[1]}/params.npz", config)
