@@ -21,6 +21,7 @@ from sklearn.cluster import AgglomerativeClustering
 from sklearn_extra.cluster import KMedoids
 from dtaidistance import dtw
 from scipy.cluster.hierarchy import linkage, fcluster
+from torch.nn.functional import normalize
 
 # types
 from parameters import Parameters
@@ -32,11 +33,6 @@ from clustering import Clustering
 ##   NOTE:                                                                                       ##
 ##   1) There is a useful method [helpers.o3d_knn] for if we want to do shearing calculations.   ##
 ###################################################################################################
-
-#--------------#
-#   settings   #
-#--------------#
-USE_CLUSTER_TRANSFORMS = False
 
 #----------------------#
 #   global constants   #
@@ -129,7 +125,7 @@ def solve(filepath_npz: str, config: Config, save_path: str = None) -> Tuple[Dic
         torch_fg_labels
         #torch.from_numpy(np_feature_means).to("cuda")
     )
-    if USE_CLUSTER_TRANSFORMS: __make_clusters_rigid(clustering, features)
+    if config.use_cluster_transforms: __make_clusters_rigid(clustering, features)
 
     print(F"Coloring Gaussians (Mode={config.color_mode})")
     cmap = cm.get_cmap('turbo', config.K)
@@ -217,71 +213,114 @@ def solve(filepath_npz: str, config: Config, save_path: str = None) -> Tuple[Dic
 
     return scene_data, clustering, {'np_fg_features':np_fg_features,'np_fg_feature_means':np_fg_feature_means}
 
-#@GPT
-def __quaternion_to_rotation_matrix(quat : torch.Tensor):
-    """
-    Convert a quaternion (w, x, y, z) to a rotation matrix.
-    quat: Tensor of shape (..., 4), where the last dimension is (w, x, y, z)
-    """
-    w, x, y, z = quat.unbind(dim=-1)
-    xx, yy, zz = x**2, y**2, z**2
-    xy, xz, yz = x*y, x*z, y*z
-    wx, wy, wz = w*x, w*y, w*z
 
-    return torch.stack([
-        [1 - 2*(yy + zz), 2*(xy - wz),     2*(xz + wy)],
-        [2*(xy + wz),     1 - 2*(xx + zz), 2*(yz - wx)],
-        [2*(xz - wy),     2*(yz + wx),     1 - 2*(xx + yy)]
-    ], dim=-1)
+#@GPT--------------------------------------------------------------------------------------------------------------------
+#@PROMPT
+# def __make_clusters_rigid(clustering: Clustering, features: Features):
+#     T = clustering.center_pos.shape[0]  # Number of time steps
 
-#@GPT
-def __make_clusters_rigid(clustering : Clustering, features : Features):
-    """
-    Mutate features such that position and rotation are a fixed transform from the cluster center.
-    """
-    if USE_CLUSTER_TRANSFORMS:
-        for c in range(clustering.num_clusters):
-            mask = clustering.masks[c]
+#     for c in range(clustering.num_clusters):
+#         mask = clustering.masks[c]  # Points belonging to cluster `c`
 
-            # Translate positions to cluster-centered coordinates
-            features.pos[:, mask] -= clustering.center_pos[:, c].unsqueeze(1)
+#         #   given: 
+#         #   features.pos[t,mask] (device=cuda) are the positions of every point which belong to cluster c in world space
+#         #   features.rot[t,mask] (device=cuda) are the rotations of every point which belong to cluster c in world space
+#         #   clustering.center_pos[t,c] (device=cuda) is the position of cluster c's coordinate system's origin
+#         #   clustering.transformations[t,c,3:7] (device=cuda) is the quaternion representing cluster c's coordinate system rotation in world space
 
-            for t in range(features.T):
-                quat_wtoc = clustering.transformations[t, c, [3, 4, 5, 6]]  # wxyz format
-                R_wtoc = __quaternion_to_rotation_matrix(quat_wtoc)
+#         # for all timesteps
+#         #   transform features.pos[t, mask] from world space to cluster coordinate space
+#         #   transform features.rot[t, mask] from world space to cluster coordinate space
 
-                # Rotate positions and rotations into cluster-aligned coordinates
-                features.pos[t, mask] = __rotate_points(features.pos[t, mask], R_wtoc)
+#         # for each point
+#             #   compute average offset in cluster coordinates across time
+#             #   compute average rotation in cluster coordinates across time
 
-                quat_features = features.rot[t, mask]  # xyzw format
-                quat_features = torch.cat([quat_features[..., 3:], quat_features[..., :3]], dim=-1)  # xyzw to wxyz
+#         # for all timesteps
+#         #   set features.pos[t,mask] to the average cluster position + the per-point average position over time
+#         #   set features.rot[t,mask] to the average cluster rotation + the per-point average rotation over time
+def quaternion_inverse(q):
+    """Compute the inverse of a quaternion assuming q is normalized."""
+    w, x, y, z = q.unbind(-1)
+    return torch.stack([w, -x, -y, -z], dim=-1)
 
-                features.rot[t, mask] = (
-                    __quaternion_to_rotation_matrix(R_wtoc).matmul(quat_features.unsqueeze(-1)).squeeze(-1)
-                )
+def quaternion_mul(q1, q2):
+    """Multiply two quaternions q1 and q2. Shape: (..., 4)"""
+    w1, x1, y1, z1 = q1.unbind(-1)
+    w2, x2, y2, z2 = q2.unbind(-1)
+    w = w1*w2 - x1*x2 - y1*y2 - z1*z2
+    x = w1*x2 + x1*w2 + y1*z2 - z1*y2
+    y = w1*y2 + y1*w2 + z1*x2 - x1*z2
+    z = w1*z2 + z1*w2 + x1*y2 - y1*x2
+    return torch.stack([w, x, y, z], dim=-1)
 
-            # Average over time in cluster coordinates
-            features.pos[:, mask] = features.pos[:, mask].mean(dim=0, keepdim=True)
-            features.rot[:, mask] = features.rot[:, mask].mean(dim=0, keepdim=True)
+def quaternion_rotate_point(q, p):
+    """Rotate point p by quaternion q."""
+    w, x, y, z = q.unbind(-1)
+    px, py, pz = p.unbind(-1)
+    t2 = w * px + y * pz - z * py
+    t3 = w * py + z * px - x * pz
+    t4 = w * pz + x * py - y * px
+    t1 = -x * px - y * py - z * pz
+    rx = t2*w - t1*x - t3*z + t4*y
+    ry = t3*w - t1*y - t4*x + t2*z
+    rz = t4*w - t1*z - t2*y + t3*x
+    return torch.stack([rx, ry, rz], dim=-1)
 
-            # Transform back to world coordinates
-            for t in range(features.T):
-                quat_ctow = clustering.transformations[t, c, [3, 4, 5, 6]]  # wxyz format
-                R_ctow = __quaternion_to_rotation_matrix(quat_ctow)
+def quaternion_average(quats):
+    """Average a set of quaternions by normalizing their sum."""
+    sum_q = quats.sum(dim=0, keepdim=True)
+    avg_q = normalize(sum_q, p=2, dim=-1)
+    return avg_q.squeeze(0)
 
-                features.pos[t, mask] = clustering.center_pos[t, c] + __rotate_points(features.pos[t, mask], R_ctow)
+def __make_clusters_rigid(clustering, features):
+    T = clustering.center_pos.shape[0]
+    num_clusters = clustering.num_clusters
 
-                quat_features = features.rot[t, mask]
-                features.rot[t, mask] = R_ctow.matmul(quat_features.unsqueeze(-1)).squeeze(-1)
+    for c in range(num_clusters):
+        mask = clustering.masks[c]  # boolean or index mask
+        # Extract per-cluster per-point data
+        # pos_world: (T, M, 3) where M = number of points in cluster c
+        pos_world = features.pos[:, mask, :]  # (T, M, 3)
+        rot_world = features.rot[:, mask, :]  # (T, M, 4)
 
-#@GPT 
-def __rotate_points(points : torch.Tensor, rotation_matrix : torch.Tensor):
-    """
-    Apply a rotation matrix to a set of points.
-    points: Tensor of shape (N, 3)
-    rotation_matrix: Tensor of shape (3, 3) or (N, 3, 3)
-    """
-    return torch.einsum("nij,nj->ni", rotation_matrix, points)
+        # Extract cluster transform
+        cluster_pos = clustering.center_pos[:, c, :]        # (T, 3)
+        cluster_quat = clustering.transformations[:, c, 3:7] # (T, 4)
+        cluster_quat_inv = quaternion_inverse(cluster_quat)  # (T, 4)
+
+        # Transform points into cluster coords
+        pos_cluster = quaternion_rotate_point(cluster_quat_inv.unsqueeze(1).expand(-1, pos_world.shape[1], -1), 
+                                              pos_world - cluster_pos.unsqueeze(1))
+
+        # Transform rotations into cluster coords
+        # rot_cluster[t,m] = q_c_inv[t] * rot_world[t,m]
+        rot_cluster = quaternion_mul(cluster_quat_inv.unsqueeze(1).expand(-1, rot_world.shape[1], -1),
+                                     rot_world)
+
+        # Compute average position and rotation for each point in cluster coordinates
+        # Average over T
+        avg_pos_cluster = pos_cluster.mean(dim=0)   # (M, 3)
+        # For rotation averaging, do it point-by-point
+        avg_rot_cluster = []
+        for m in range(rot_cluster.shape[1]):
+            avg_rot_cluster.append(quaternion_average(rot_cluster[:, m, :]))
+        avg_rot_cluster = torch.stack(avg_rot_cluster, dim=0)  # (M, 4)
+
+
+
+        # Transform back to world:
+        pos_world_rigid = quaternion_rotate_point(cluster_quat.unsqueeze(1).expand(-1, avg_pos_cluster.shape[0], -1),
+                                                  avg_pos_cluster.unsqueeze(0)) + cluster_pos.unsqueeze(1)
+        rot_world_rigid = quaternion_mul(cluster_quat.unsqueeze(1).expand(-1, avg_rot_cluster.shape[0], -1),
+                                         avg_rot_cluster.unsqueeze(0))
+
+        # Assign back
+        features.pos[:, mask, :] = pos_world_rigid
+        features.rot[:, mask, :] = rot_world_rigid
+
+    return features
+#@ENDGPT--------------------------------------------------------------------------------------------------------------------
 
 import threading
 def analyze_cluster_adjacency(masks, np_fg_features, np_fg_feature_means, show=False) -> np.ndarray :
@@ -639,8 +678,8 @@ def main(filepath_npz: str, config: Config, clustering_filepath: str = None , sa
     pcd.colors = init_cols
     vis.add_geometry(pcd)
 
-    cluster_center_dots = initialize_cluster_center_dots(clustering, vis)
-    # xform_lineset = initialize_xform_lineset(clustering, vis)
+    #cluster_center_dots = initialize_cluster_center_dots(clustering, vis)
+    #xform_lineset = initialize_xform_lineset(clustering, vis)
     cluster_adjacency_matrix = analyze_cluster_adjacency(clustering.masks, miscellaneous['np_fg_features'], miscellaneous['np_fg_feature_means'], show=config.show_adjacency)
     adj_lineset, graph = initialize_adjacency_lineset(cluster_adjacency_matrix, clustering, vis, arborescence=config.arborescence)
 
@@ -696,8 +735,8 @@ def main(filepath_npz: str, config: Config, clustering_filepath: str = None , sa
         pcd.colors = cols
         vis.update_geometry(pcd)
 
-        update_cluster_centers(t, clustering, w2c, cluster_center_dots, vis, graph)
-        # update_lineset(t, clustering, w2c, xform_lineset, vis)
+        #update_cluster_centers(t, clustering, w2c, cluster_center_dots, vis, graph)
+        #update_lineset(t, clustering, w2c, xform_lineset, vis)
         update_adjacency_lineset(t, clustering, w2c, adj_lineset, vis)
 
         #----------------------#
@@ -722,21 +761,22 @@ if __name__ == "__main__":
         "POS" :  64,      
         "ROT" :  0, # ROT seems like a bad feature even though it contains some information
         "DPOS":  1,
-        "DROT":  8,
+        "DROT":  10,
         "pre_normalize":True,
         "remove_bg":True,
         "color_mode":sys.argv[2],
-        "arborescence":True,
+        "arborescence":False,
         "show_adjacency":True,
+        "use_cluster_transforms":True,
     }
 
-    K=26
+    K=55
     if len(sys.argv) > 3:
         if sys.argv[3] == "MEDOIDS":
             config = KMedoidsConfig(
                 K=K, 
                 sample_size=2000,
-                samplings=5,
+                samplings=10,
                 **base_config
             )
     else:

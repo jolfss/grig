@@ -23,6 +23,9 @@ class BaseConfig:
     arborescence:bool
     "If `true`, solves for the minimum arborescence instead of the minimum spanning tree of the adjacency weight matrix."
 
+    use_cluster_transforms:bool
+    "Whether or not to lock clusters to their centerpoints/bones."
+
     POS:float
     "The weighting of the `POS` feature."
 
