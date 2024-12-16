@@ -6,6 +6,7 @@ import open3d as o3d
 from visualize import init_camera, render, rgbd2pcd 
 import torch
 import numpy as np
+import os
 
 # our imports
 import matplotlib.cm as cm
@@ -135,34 +136,253 @@ def find_closest_cluster(clustering: Clustering, reference_idx: int, direction: 
 
     return closest_idx
 
-def assign_clusters_to_body_parts(clustering: 'Clustering', scene_data: List[Dict[str, torch.Tensor]], threshold: float = 0.5) -> Dict[int, BodyPart]:
+import numpy as np
+from sklearn.neighbors import KDTree
+from collections import deque
+from typing import Dict, List, Optional
+from enum import Enum
 
-    """ This is the best result we could ever get with KD-Tree + enforeced topology. I recorded the body assignment and hardcoded them ..."""
+# Assuming BodyPart Enum is defined as in your original code
+class BodyPart(Enum):
+    TORSO = 'torso'
+    HEAD = 'head'
+    CHEST = 'chest'
+    WAIST = 'waist'
+    SHOULDERS_LEFT = 'shoulders_left'
+    SHOULDERS_RIGHT = 'shoulders_right'
+    NECK = 'neck'
+    CLAVICLE_LEFT = 'clavicle_left'
+    CLAVICLE_RIGHT = 'clavicle_right'
+    UPPER_ARM_LEFT = 'upper_arm_left'
+    LOWER_ARM_LEFT = 'lower_arm_left'
+    HAND_LEFT = 'hand_left'
+    UPPER_ARM_RIGHT = 'upper_arm_right'
+    LOWER_ARM_RIGHT = 'lower_arm_right'
+    HAND_RIGHT = 'hand_right'
+    UPPER_LEG_LEFT = 'upper_leg_left'
+    LOWER_LEG_LEFT = 'lower_leg_left'
+    FOOT_LEFT = 'foot_left'
+    UPPER_LEG_RIGHT = 'upper_leg_right'
+    LOWER_LEG_RIGHT = 'lower_leg_right'
+    FOOT_RIGHT = 'foot_right'
+    # Add more body parts as needed
+
+def assign_clusters_to_body_parts(
+    clustering: 'Clustering',
+    scene_data: List[Dict[str, torch.Tensor]],
+    threshold: float = 0.5,
+    verbose: bool = True
+) -> Dict[int, BodyPart]:
+    """
+    Automatically assigns clusters to body parts based on a 9-dimensional feature space
+    and skeletal hierarchy, utilizing KDTree for efficient nearest neighbor searches.
+
+    Args:
+        clustering (Clustering): Clustering information containing cluster centers.
+        scene_data (List[Dict[str, torch.Tensor]]): Scene data loaded from clustering.
+        threshold (float): Maximum allowable distance to consider for assignment.
+        verbose (bool): If True, prints detailed logs.
+
+    Returns:
+        Dict[int, BodyPart]: Mapping from cluster index to BodyPart.
+    """
+    # Compute average and standard deviation features across all timesteps
+    centers_t = clustering.centers.cpu().numpy()       # Shape: (T, K, 3)
+    dpos_t = clustering.center_dpos.cpu().numpy()     # Shape: (T, K, 3)
+    drot_t = clustering.center_drot.cpu().numpy()     # Shape: (T, K, 3)
+    
+    T, K, _ = centers_t.shape
+    
+    # Aggregate features over all timesteps
+    centers_mean = centers_t.mean(axis=0)             # Shape: (K, 3)
+    dpos_mean = dpos_t.mean(axis=0)                   # Shape: (K, 3)
+    drot_mean = drot_t.mean(axis=0)                   # Shape: (K, 3)
+    
+    # Combine aggregated features into a single feature vector per cluster (9D)
+    combined_features = np.hstack((
+        centers_mean,    # Mean Position: x, y, z
+        dpos_mean,       # Mean Velocity: dpos_x, dpos_y, dpos_z
+        drot_mean        # Mean Rotation: drot_x, drot_y, drot_z
+    ))  # Shape: (K, 9)
+    
+    if verbose:
+        print(f"Combined feature shape: {combined_features.shape}")
+    
+    # Initialize cluster assignments
     cluster_assignments: Dict[int, BodyPart] = {}
-
-    # manually assign
-    cluster_assignments[5] = BodyPart.TORSO
-    cluster_assignments[14] = BodyPart.HEAD
-    cluster_assignments[1] = BodyPart.WAIST
-    cluster_assignments[2] = BodyPart.UPPER_ARM_LEFT
-    cluster_assignments[25] = BodyPart.LOWER_ARM_LEFT
-    cluster_assignments[10] = BodyPart.HAND_LEFT
-    cluster_assignments[0] = BodyPart.UPPER_ARM_RIGHT
-    cluster_assignments[21] = BodyPart.LOWER_ARM_RIGHT
-    cluster_assignments[15] = BodyPart.HAND_RIGHT
-    cluster_assignments[20] = BodyPart.UPPER_LEG_LEFT
-    cluster_assignments[26] = BodyPart.LOWER_LEG_LEFT
-    cluster_assignments[12] = BodyPart.FOOT_LEFT
-    cluster_assignments[13] = BodyPart.UPPER_LEG_RIGHT
-    cluster_assignments[6] = BodyPart.LOWER_LEG_RIGHT
-    cluster_assignments[9] = BodyPart.FOOT_RIGHT
-    cluster_assignments[19] = BodyPart.SHOULDERS_LEFT
-    cluster_assignments[17] = BodyPart.SHOULDERS_RIGHT
-    cluster_assignments[11] = BodyPart.CLAVICLE_LEFT
-    cluster_assignments[3] = BodyPart.CLAVICLE_RIGHT
+    assigned_clusters = set()
+    
+    # Define the skeletal hierarchy connections
+    BODY_CONNECTIONS: Dict[BodyPart, List[BodyPart]] = {
+        BodyPart.TORSO: [
+            BodyPart.CLAVICLE_LEFT,
+            BodyPart.CLAVICLE_RIGHT,
+            BodyPart.HEAD,
+            BodyPart.UPPER_LEG_LEFT,
+            BodyPart.UPPER_LEG_RIGHT
+        ],
+        BodyPart.CLAVICLE_LEFT: [
+            BodyPart.SHOULDERS_LEFT
+        ],
+        BodyPart.CLAVICLE_RIGHT: [
+            BodyPart.SHOULDERS_RIGHT
+        ],
+        BodyPart.SHOULDERS_LEFT: [
+            BodyPart.UPPER_ARM_LEFT
+        ],
+        BodyPart.SHOULDERS_RIGHT: [
+            BodyPart.UPPER_ARM_RIGHT
+        ],
+        BodyPart.HEAD: [
+            BodyPart.NECK
+        ],
+        BodyPart.NECK: [
+            BodyPart.CHEST
+        ],
+        BodyPart.CHEST: [
+            BodyPart.WAIST
+        ],
+        BodyPart.UPPER_ARM_LEFT: [
+            BodyPart.LOWER_ARM_LEFT
+        ],
+        BodyPart.LOWER_ARM_LEFT: [
+            BodyPart.HAND_LEFT
+        ],
+        BodyPart.UPPER_ARM_RIGHT: [
+            BodyPart.LOWER_ARM_RIGHT
+        ],
+        BodyPart.LOWER_ARM_RIGHT: [
+            BodyPart.HAND_RIGHT
+        ],
+        BodyPart.UPPER_LEG_LEFT: [
+            BodyPart.LOWER_LEG_LEFT
+        ],
+        BodyPart.LOWER_LEG_LEFT: [
+            BodyPart.FOOT_LEFT
+        ],
+        BodyPart.UPPER_LEG_RIGHT: [
+            BodyPart.LOWER_LEG_RIGHT
+        ],
+        BodyPart.LOWER_LEG_RIGHT: [
+            BodyPart.FOOT_RIGHT
+        ],
+        # Add more connections as needed
+    }
+    
+    # Define direction vectors for body parts relative to their parents
+    # These vectors should point towards where the child body part is expected relative to the parent
+    BODY_PART_DIRECTIONS: Dict[BodyPart, np.ndarray] = {
+        BodyPart.CLAVICLE_LEFT: np.array([0, -1, 0]),  
+        BodyPart.CLAVICLE_RIGHT: np.array([0.26, -1, 0]),  
+        BodyPart.HEAD: np.array([0, -1, 0]),            # Up (Negative Y)
+        BodyPart.UPPER_LEG_LEFT: np.array([-0.5, 1, 0]),  # Down-Left (Positive Y)
+        BodyPart.UPPER_LEG_RIGHT: np.array([0.5, 1, 0]),  # Down-Right (Positive Y)
+        BodyPart.SHOULDERS_LEFT: np.array([-1, 0, 0]),
+        BodyPart.SHOULDERS_RIGHT: np.array([1, 0, 0]),
+        BodyPart.NECK: np.array([0, -1, 0]),            # Up (Negative Y)
+        BodyPart.CHEST: np.array([0, -1, 0]),           # Up (Negative Y)
+        BodyPart.WAIST: np.array([0, 1, 0]),            # Down (Positive Y)
+        BodyPart.UPPER_ARM_LEFT: np.array([-1, 0, 0]),
+        BodyPart.UPPER_ARM_RIGHT: np.array([1, 0, 0]),
+        BodyPart.LOWER_ARM_LEFT: np.array([-1, 0, 0]),
+        BodyPart.LOWER_ARM_RIGHT: np.array([1, 0, 0]),
+        BodyPart.HAND_LEFT: np.array([-1, 0, 0]),
+        BodyPart.HAND_RIGHT: np.array([1, 0, 0]),
+        BodyPart.LOWER_LEG_LEFT: np.array([-0.5, 1, 0]),
+        BodyPart.LOWER_LEG_RIGHT: np.array([0.5, 1, 0]),
+        BodyPart.FOOT_LEFT: np.array([-0.5, 1, 0]),
+        BodyPart.FOOT_RIGHT: np.array([0.5, 1, 0]),
+        # Add more directions as needed
+    }
 
     
+    # Initialize BFS queue
+    queue = deque()
+    
+    # Assign the torso to cluster 5
+    torso_cluster = 5
+    if torso_cluster >= K or torso_cluster < 0:
+        print(f"Error: Torso cluster index {torso_cluster} is out of bounds.")
+        return cluster_assignments  # Return empty assignments
+    
+    cluster_assignments[torso_cluster] = BodyPart.TORSO
+    body_part_to_cluster: Dict[BodyPart, int] = {BodyPart.TORSO: torso_cluster}
+    assigned_clusters.add(torso_cluster)
+    queue.append(BodyPart.TORSO)
+    
+    if verbose:
+        print(f"Assigned BodyPart.TORSO to cluster {torso_cluster}.")
+    
+    # Build KDTree with the 9D features
+    tree = KDTree(combined_features)
+    
+    while queue:
+        current_body_part = queue.popleft()
+        current_cluster = body_part_to_cluster[current_body_part]
+        current_feature = combined_features[current_cluster]
+    
+        if verbose:
+            print(f"\nProcessing BodyPart.{current_body_part.value} (Cluster {current_cluster})")
+    
+        # Get child body parts
+        child_body_parts = BODY_CONNECTIONS.get(current_body_part, [])
+    
+        for child_part in child_body_parts:
+            if child_part in body_part_to_cluster:
+                if verbose:
+                    print(f"Body part {child_part.value} is already assigned to cluster {body_part_to_cluster[child_part]}. Skipping.")
+                continue  # Already assigned
+    
+            direction = BODY_PART_DIRECTIONS.get(child_part, np.array([0, 0, 0]))
+            if np.linalg.norm(direction) == 0:
+                if verbose:
+                    print(f"No direction defined for body part {child_part.value}. Skipping assignment.")
+                continue  # No direction defined
+    
+            # Normalize the direction vector
+            direction_normalized = direction / np.linalg.norm(direction)
+    
+            average_distance = threshold  # You can adjust this based on data characteristics
+            expected_position = centers_mean[current_cluster] + direction_normalized * average_distance
+
+            query_feature = combined_features[current_cluster].copy()
+            query_feature[:3] = expected_position  # Update position
+            indices = tree.query_radius([query_feature], r=threshold)[0]
+    
+            valid_candidates = []
+            for idx in indices:
+                if idx in assigned_clusters:
+                    continue
+                vec = centers_mean[idx] - centers_mean[current_cluster]
+                if np.dot(vec, direction_normalized) > 0: 
+                    distance = np.linalg.norm(vec)
+                    valid_candidates.append((idx, distance))
+    
+            if not valid_candidates:
+                if verbose:
+                    print(f"No valid candidates found for BodyPart.{child_part.value} from Cluster {current_cluster}.")
+                continue
+
+            valid_candidates.sort(key=lambda x: x[1])
+            closest_idx, closest_distance = valid_candidates[0]
+
+            cluster_assignments[closest_idx] = child_part
+            body_part_to_cluster[child_part] = closest_idx
+            assigned_clusters.add(closest_idx)
+            queue.append(child_part)
+    
+            if verbose:
+                print(f"Assigned BodyPart.{child_part.value} to Cluster {closest_idx} (Distance: {closest_distance:.3f}).")
+    
+    # After BFS, report unassigned clusters
+    unassigned_clusters = set(range(K)) - assigned_clusters
+    if unassigned_clusters and verbose:
+        print(f"\nUnassigned Clusters: {unassigned_clusters}")
+    elif verbose:
+        print("\nAll clusters have been assigned.")
+    
     return cluster_assignments
+
 
 def validate_assignments(cluster_assignments: Dict[int, BodyPart], required_parts: List[BodyPart]) -> bool:
     """ Validates that all required body parts have been assigned. """
@@ -255,6 +475,27 @@ def find_skeleton_chains(clustering: Clustering, cluster_assignments: Dict[int, 
             print(f"Created chain: {parent_part.value} (Cluster {parent_cluster}) -> {child_part.value} (Cluster {child_cluster})")
     
     return chains
+
+def assign_clusters_to_body_parts_from_file(assignments_filepath: str) -> Dict[int, BodyPart]:
+    """
+    Loads cluster assignments from a .npz file.
+
+    Args:
+        assignments_filepath (str): Path to the .npz file containing cluster assignments.
+
+    Returns:
+        Dict[int, BodyPart]: Mapping from cluster index to BodyPart.
+    """
+    if not os.path.exists(assignments_filepath):
+        raise FileNotFoundError(f"Cannot find {assignments_filepath}")
+
+    assign_data = np.load(assignments_filepath)
+    cluster_indices = assign_data['cluster_indices']
+    body_parts = assign_data['body_parts']
+
+    cluster_assignments = {int(idx): BodyPart(bp) for idx, bp in zip(cluster_indices, body_parts)}
+    return cluster_assignments
+
 
 def compute_joints(clustering: Clustering, cluster_chains: List[List[int]]) -> np.ndarray:
     """ Computes the joint positions as the midpoint between connected clusters in each chain. """
