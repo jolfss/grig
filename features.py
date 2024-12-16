@@ -96,8 +96,6 @@ class Features:
 
 
         self.features = [] 
-        if config.pre_normalize:
-            print("Normalizing Features Before Weighting")
 
         def normalize(t:torch.Tensor):
             return (t - t.mean(dim=0, keepdim=True))/t.std(dim=0,keepdim=True)

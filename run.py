@@ -46,19 +46,20 @@ fps = 15
 #-------------#
 #   methods   #
 #-------------#
-@torch.no_grad()
-def solve(filepath_npz: str, config: Config, save_path: str = None) -> Tuple[Dict[str, torch.Tensor], Clustering, Dict[str,Any]]:
+def solve(filepath_npz: str, config: Config, save_path: str = None, silent=False) -> Tuple[Dict[str, torch.Tensor], Clustering, Dict[str,Any]]:
     """
     The clustering algorithm `(param_filepath, config) -> (scene_data, clustering, miscellaneous)`. 
     """
+    def _print(string): 
+        if not silent: _print(string)
     
-    print(F"Opening {filepath_npz}")
+    _print(F"Opening {filepath_npz}")
     params = dict(np.load(filepath_npz))
     params = {k: torch.tensor(v).cuda().float() for k, v in params.items()}
     params = {key : params[key] for key in Parameters.__dataclass_fields__ if key in params}
     params = Parameters(**params)
 
-    print("Preparing Foreground Features")
+    _print("Preparing Foreground Features")
     features = Features(params, config)
     np_fg_features : np.ndarray = features.features[features.is_fg].cpu().numpy()
 
@@ -90,7 +91,7 @@ def solve(filepath_npz: str, config: Config, save_path: str = None) -> Tuple[Dic
         return pos_dist + rot_dist + dpos_dist + drot_dist
 
     if isinstance(config, KMeansConfig):
-        print(F"Clustering Foreground Gaussians")
+        _print(F"Clustering Foreground Gaussians")
         kmeans = KMeans(n_clusters=config.K, n_init=1)
         kmeans.fit(np_fg_features)
         np_fg_labels = kmeans.labels_
@@ -98,7 +99,7 @@ def solve(filepath_npz: str, config: Config, save_path: str = None) -> Tuple[Dic
         torch_fg_labels = torch.from_numpy(np_fg_labels).long()  # Needs to be on CPU for apply_
     elif isinstance(config, KMedoidsConfig):
         # TODO: implementation of KMedoids
-        print("Clustering Foreground Gaussians using KMedoids")
+        _print("Clustering Foreground Gaussians using KMedoids")
         from sklearn_extra.cluster import CLARA
         kmedoids = CLARA(n_clusters=config.K,n_sampling=config.sample_size, n_sampling_iter=config.samplings)#, metric=custom_dist)
         kmedoids.fit(np_fg_features)
@@ -106,7 +107,7 @@ def solve(filepath_npz: str, config: Config, save_path: str = None) -> Tuple[Dic
         np_fg_feature_means = kmedoids.cluster_centers_
         torch_fg_labels = torch.from_numpy(np_fg_labels).long()  # Needs to be on CPU for apply_
     else:
-        print(F"Unsupported Config Type: {type(config), config}")
+        _print(F"Unsupported Config Type: {type(config), config}")
         return
     
     # sort based on cluster population
@@ -127,7 +128,7 @@ def solve(filepath_npz: str, config: Config, save_path: str = None) -> Tuple[Dic
     )
     if config.use_cluster_transforms: __make_clusters_rigid(clustering, features)
 
-    print(F"Coloring Gaussians (Mode={config.color_mode})")
+    _print(F"Coloring Gaussians (Mode={config.color_mode})")
     cmap = cm.get_cmap('turbo', config.K)
     feature_colors = None
     if config.color_mode == "POS": # Color by magnitude of position
@@ -188,7 +189,7 @@ def solve(filepath_npz: str, config: Config, save_path: str = None) -> Tuple[Dic
     if feature_colors is not None:
         colors[:,features.is_fg] = feature_colors 
 
-    print(F"Preparing Rendervars")
+    _print(F"Preparing Rendervars")
     scene_data = []
     for t in range(len(features.pos)):
         rendervar = {
@@ -322,8 +323,7 @@ def __make_clusters_rigid(clustering, features):
     return features
 #@ENDGPT--------------------------------------------------------------------------------------------------------------------
 
-import threading
-def analyze_cluster_adjacency(masks, np_fg_features, np_fg_feature_means, show=False) -> np.ndarray :
+def analyze_cluster_adjacency(masks, np_fg_features, np_fg_feature_means, save_path: str = None, show=False) -> np.ndarray:
     distances = pairwise_distances(np_fg_features, np_fg_feature_means)
     sorted_clusters = distances.argsort(axis=1)
     _1NN_ids = sorted_clusters[:, 0]
@@ -338,21 +338,23 @@ def analyze_cluster_adjacency(masks, np_fg_features, np_fg_feature_means, show=F
         if mask_sum > 0:
             matrix[i] /= mask_sum
 
-    # Run plotting in a separate thread
-    if show:
-        def plot():
-            plt.figure(figsize=(6, 6))
-            plt.imshow(matrix, origin='upper',cmap='Greys_r')
-            plt.title("Asymmetric Normalized 2D Matrix of 1NN and 2NN Counts")
-            plt.xlabel("2NN Cluster ID")
-            plt.ylabel("1NN Cluster ID")
-            plt.grid(False)
+    if show or save_path:
+        plt.figure(figsize=(6, 6))
+        plt.imshow(matrix, origin='upper', cmap='Greys_r')
+        plt.title("Asymmetric Normalized 2D Matrix of 1NN and 2NN Counts")
+        plt.xlabel("2NN Cluster ID")
+        plt.ylabel("1NN Cluster ID")
+        plt.grid(False)
+        plt.tight_layout()
 
-            plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path, dpi=300)
+        if show:
             plt.show()
-        threading.Thread(target=plot).start()
-    
+        plt.close()
+
     return matrix
+
 
 import networkx as nx
 def initialize_adjacency_lineset(distance_matrix : np.ndarray, clustering:Clustering, vis:o3d.visualization.Visualizer, arborescence=False) -> o3d.geometry.LineSet:
@@ -678,7 +680,7 @@ def main(filepath_npz: str, config: Config, clustering_filepath: str = None , sa
     pcd.colors = init_cols
     vis.add_geometry(pcd)
 
-    #cluster_center_dots = initialize_cluster_center_dots(clustering, vis)
+    cluster_center_dots = initialize_cluster_center_dots(clustering, vis)
     #xform_lineset = initialize_xform_lineset(clustering, vis)
     cluster_adjacency_matrix = analyze_cluster_adjacency(clustering.masks, miscellaneous['np_fg_features'], miscellaneous['np_fg_feature_means'], show=config.show_adjacency)
     adj_lineset, graph = initialize_adjacency_lineset(cluster_adjacency_matrix, clustering, vis, arborescence=config.arborescence)
@@ -735,7 +737,7 @@ def main(filepath_npz: str, config: Config, clustering_filepath: str = None , sa
         pcd.colors = cols
         vis.update_geometry(pcd)
 
-        #update_cluster_centers(t, clustering, w2c, cluster_center_dots, vis, graph)
+        update_cluster_centers(t, clustering, w2c, cluster_center_dots, vis, graph)
         #update_lineset(t, clustering, w2c, xform_lineset, vis)
         update_adjacency_lineset(t, clustering, w2c, adj_lineset, vis)
 
@@ -770,7 +772,7 @@ if __name__ == "__main__":
         "use_cluster_transforms":True,
     }
 
-    K=55
+    K=28
     if len(sys.argv) > 3:
         if sys.argv[3] == "MEDOIDS":
             config = KMedoidsConfig(
@@ -788,3 +790,243 @@ if __name__ == "__main__":
     print(F"Using config: {config}")
 
     main(F"./output/pretrained/{sys.argv[1]}/params.npz", config)
+
+
+def initialize_adjacency_lineset_offscreen(distance_matrix: np.ndarray, clustering, arborescence=False):
+    # Convert distances into weights
+    weight_matrix = np.vectorize(lambda dist:1/max(dist,1e-16))(distance_matrix)
+
+    # Build graph and compute MST or Arborescence
+    if arborescence:
+        # Directed minimum spanning arborescence
+        adj = nx.minimum_spanning_arborescence(nx.from_numpy_matrix(weight_matrix, create_using=nx.DiGraph))
+    else:
+        # Undirected minimum spanning tree
+        adj = nx.minimum_spanning_tree(nx.from_numpy_matrix(weight_matrix))
+
+    adj_lineset = o3d.geometry.LineSet()
+    adj_lines = np.zeros((clustering.num_clusters-1, 2), dtype=np.int32)
+
+    for i, (u, v) in enumerate(adj.edges):
+        adj_lines[i] = [u, v]
+
+    adj_lineset.lines = o3d.utility.Vector2iVector(adj_lines)
+    # We'll set points later when we have camera transformations, if needed.
+    adj_lineset.paint_uniform_color([1, 1, 0])
+
+    # IMPORTANT: Do NOT add to vis here, just return geometry and adjacency.
+    return adj_lineset, adj
+
+def update_adjacency_lineset_offscreen(t: int, clustering, w2c: np.ndarray, adj_lineset: o3d.geometry.LineSet, 
+                             renderer: o3d.visualization.rendering.OffscreenRenderer, name: str, material):
+    """Updates the adjacency lineset visualization for timestep `t`.
+    Here, `name` is the identifier used when the geometry was added to the renderer scene.
+    `material` is the MaterialRecord used when originally adding the geometry."""
+    centers_t = clustering.center_pos[t].cpu()
+    __new_cluster_center_points = np.concatenate([centers_t.numpy(), np.ones((clustering.num_clusters, 1))], axis=-1)
+    __new_cluster_center_points = __new_cluster_center_points @ w2c.T
+    __new_cluster_center_points[:, :3] *= 0.25
+    __new_cluster_center_points = __new_cluster_center_points @ np.linalg.inv(w2c).T
+
+    adj_lineset.points = o3d.utility.Vector3dVector(__new_cluster_center_points[:, :3])
+    adj_lineset.paint_uniform_color([1, 1, 0])
+
+    # Remove old geometry and re-add the updated one
+    renderer.scene.remove_geometry(name)
+    renderer.scene.add_geometry(name, adj_lineset, material)
+
+def initialize_cluster_center_dots_offscreen(clustering) -> List[o3d.geometry.TriangleMesh]:
+    """Initializes the cluster center dots (small spheres) but does not add them to a scene.
+       Just returns the list of geometries."""
+    cluster_center_dots = []
+    for _ in range(clustering.num_clusters):
+        center = o3d.geometry.TriangleMesh.create_sphere(radius=0.003)
+        center.paint_uniform_color([1, 1, 1])
+        cluster_center_dots.append(center)
+    return cluster_center_dots
+
+def update_cluster_centers_offscreen(
+    t: int, 
+    clustering, 
+    w2c: np.ndarray, 
+    cluster_center_dots: List[o3d.geometry.TriangleMesh],
+    renderer: o3d.visualization.rendering.OffscreenRenderer,
+    names: List[str],
+    materials: List[o3d.visualization.rendering.MaterialRecord],
+    graph: Optional[Union[nx.DiGraph, nx.Graph]] = None,
+):
+    """Updates the center dots visualization to timestep `t`.
+       `names` is a list of geometry identifiers as added to the renderer scene.
+       `materials` is a list of MaterialRecords for each dot geometry.
+    """
+    centers_t = clustering.center_pos[t].cpu()
+    __new_cluster_center_points = np.concatenate([centers_t.numpy(), np.ones((clustering.num_clusters, 1))], axis=-1)
+    __new_cluster_center_points = __new_cluster_center_points @ w2c.T
+    __new_cluster_center_points[:, :3] *= 0.25
+    __new_cluster_center_points = __new_cluster_center_points @ np.linalg.inv(w2c).T
+
+    colors = None
+    if isinstance(graph, nx.DiGraph):
+        # Compute coloring based on depth in a directed graph.
+        root = [node for node, in_degree in graph.in_degree() if in_degree == 0]
+        if len(root) != 1:
+            raise ValueError("The graph must have exactly one root node.")
+        root = root[0]
+
+        depths = nx.single_source_shortest_path_length(graph, root)
+        max_depth = max(depths.values())
+        norm_depths = np.array([depths.get(i, max_depth + 1) for i in range(clustering.num_clusters)]) / max_depth
+
+        import matplotlib.pyplot as plt
+        cmap = plt.cm.get_cmap("Greys")
+        colors = cmap(norm_depths)[:, :3]
+
+    # Update the position of each sphere and re-add to renderer scene
+    for c in range(clustering.num_clusters):
+        # Translate the geometry to the new position
+        # Note: "translate(..., relative=False)" means the translation sets the absolute position.
+        # We can achieve this by resetting the geometry to origin and then translating:
+        old_mesh = cluster_center_dots[c]
+        # To "reset" the mesh's transform, we can either recreate it or apply transformations carefully.
+        # Here, for simplicity, we'll just translate relative to current position.
+        # If it's already moved, we might need to reset it first. A trick is to store initial mesh before transformations.
+        # For now, assume we know that each update sets an absolute position. We can do:
+        old_mesh.translate(-old_mesh.get_center())  # move back to origin
+        old_mesh.translate(__new_cluster_center_points[c, :3])  # move to new absolute position
+
+        # Update color if needed
+        if colors is not None:
+            old_mesh.paint_uniform_color(colors[c])
+        else:
+            old_mesh.paint_uniform_color([1,1,1])
+
+        # Re-add geometry with the same name and material
+        renderer.scene.remove_geometry(names[c])
+        renderer.scene.add_geometry(names[c], old_mesh, materials[c])
+
+@torch.no_grad()
+def capture_timestep_offscreen(filepath_npz: str, config, save_name: str, timestep: int = 0):
+    # Load scene data
+    scene_data, clustering, miscellaneous = solve(filepath_npz, config, silent=True)
+
+    # Initialize camera
+    w2c, k = init_camera()
+    width = int(w * view_scale)
+    height = int(h * view_scale)
+
+    # Create offscreen renderer
+    renderer = o3d.visualization.rendering.OffscreenRenderer(width, height)
+    renderer.scene.scene.set_indirect_light_intensity(0.0)
+    renderer.scene.scene.set_sun_light([0, 0, -1], [1, 1, 1], 0.0)
+
+
+    # Render initial scene data (timestep = 0)
+    im, depth = render(w2c, k, scene_data[0])
+    init_pts, init_cols = rgbd2pcd(im, depth, w2c, k, show_depth=False)
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = init_pts
+    pcd.colors = init_cols
+
+    # Define a material for unlit rendering
+    mat = o3d.visualization.rendering.MaterialRecord()
+    #mat.shader = "defaultUnlit"
+    mat.point_size = float(view_scale)
+
+    # Add pointcloud to the scene
+    renderer.scene.add_geometry("pointcloud", pcd, mat)
+
+    # Initialize cluster centers (as small spheres)
+    cluster_center_geometries = initialize_cluster_center_dots_offscreen(clustering)
+
+    # Create lists for names and materials of cluster centers
+    dot_names = []
+    dot_materials = []
+    for i, ccdot in enumerate(cluster_center_geometries):
+        name = f"cluster_center_{i}"
+        dot_names.append(name)
+        dot_materials.append(mat)
+        renderer.scene.add_geometry(name, ccdot, mat)
+
+    # Compute adjacency matrix and save figure
+    distances = pairwise_distances(miscellaneous['np_fg_features'], miscellaneous['np_fg_feature_means'])
+    sorted_clusters = distances.argsort(axis=1)
+    _1NN_ids = sorted_clusters[:, 0]
+    _2NN_ids = sorted_clusters[:, 1]
+
+    cluster_adjacency_matrix = np.zeros((config.K, config.K), dtype=float)
+    for i, j in zip(_1NN_ids, _2NN_ids):
+        cluster_adjacency_matrix[i, j] += 1
+
+    for i in np.unique(_1NN_ids):
+        mask_sum = torch.sum(clustering.masks[i]).item()
+        if mask_sum > 0:
+            cluster_adjacency_matrix[i] /= mask_sum
+
+    plt.figure(figsize=(6, 6))
+    plt.imshow(cluster_adjacency_matrix, origin='upper', cmap='Greys_r')
+    plt.title("Asymmetric Normalized 2D Matrix of 1NN and 2NN Counts")
+    plt.xlabel("2NN Cluster ID")
+    plt.ylabel("1NN Cluster ID")
+    plt.grid(False)
+    plt.tight_layout()
+
+    if not os.path.exists("hpsearch/matrices/"):
+        os.makedirs("hpsearch/matrices")
+    plt.savefig(f"hpsearch/matrices/{save_name}.png", dpi=300)
+    plt.close()
+
+    # Initialize adjacency lineset offscreen
+    adj_lineset, graph = initialize_adjacency_lineset_offscreen(cluster_adjacency_matrix, clustering, arborescence=config.arborescence)
+    line_name = "adj_lineset"
+    line_material = mat  # could define another if you like
+    renderer.scene.add_geometry(line_name, adj_lineset, line_material)
+
+    # Setup camera
+    view_k = k * view_scale
+    view_k[2, 2] = 1
+
+    cam_params = o3d.camera.PinholeCameraParameters()
+    cam_params.extrinsic = w2c
+    cam_params.intrinsic.set_intrinsics(width, height, view_k[0,0], view_k[1,1], view_k[0,2], view_k[1,2])
+
+    renderer.setup_camera(cam_params.intrinsic, cam_params.extrinsic)
+
+    # Update scene for the given timestep
+    im, depth = render(w2c, k, scene_data[timestep])
+    pts, cols = rgbd2pcd(im, depth, w2c, k, show_depth=False)
+    pcd.points = pts
+    pcd.colors = cols
+    # Update the pointcloud by removing and re-adding it
+    renderer.scene.remove_geometry("pointcloud")
+    renderer.scene.add_geometry("pointcloud", pcd, mat)
+
+    # Update cluster centers and adjacency lines
+    update_cluster_centers_offscreen(
+        timestep, 
+        clustering, 
+        w2c, 
+        cluster_center_geometries, 
+        renderer, 
+        dot_names, 
+        dot_materials, 
+        graph=graph
+    )
+
+    update_adjacency_lineset_offscreen(
+        timestep, 
+        clustering, 
+        w2c, 
+        adj_lineset, 
+        renderer,
+        line_name,
+        line_material
+    )
+
+    # Render final image
+    img = renderer.render_to_image()
+    if not os.path.exists("hpsearch/renders"):
+        os.makedirs("hpsearch/renders")
+    o3d.io.write_image(f"hpsearch/renders/{save_name}.png", img)
+
+    del renderer
+
