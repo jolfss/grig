@@ -167,25 +167,29 @@ class BodyPart(Enum):
     FOOT_RIGHT = 'foot_right'
     # Add more body parts as needed
 
-def assign_clusters_to_body_parts(
+def assign_clusters_to_body_parts_enforced(
     clustering: 'Clustering',
     scene_data: List[Dict[str, torch.Tensor]],
     threshold: float = 0.5,
+    ignored_clusters: Optional[List[int]] = None,
     verbose: bool = True
 ) -> Dict[int, BodyPart]:
     """
     Automatically assigns clusters to body parts based on a 9-dimensional feature space
     and skeletal hierarchy, utilizing KDTree for efficient nearest neighbor searches.
+    Clusters specified in ignored_clusters are excluded from assignment.
 
     Args:
         clustering (Clustering): Clustering information containing cluster centers.
         scene_data (List[Dict[str, torch.Tensor]]): Scene data loaded from clustering.
         threshold (float): Maximum allowable distance to consider for assignment.
+        ignored_clusters (Optional[List[int]]): List of cluster indices to ignore.
         verbose (bool): If True, prints detailed logs.
 
     Returns:
         Dict[int, BodyPart]: Mapping from cluster index to BodyPart.
     """
+
     # Compute average and standard deviation features across all timesteps
     centers_t = clustering.centers.cpu().numpy()       # Shape: (T, K, 3)
     dpos_t = clustering.center_dpos.cpu().numpy()     # Shape: (T, K, 3)
@@ -211,6 +215,18 @@ def assign_clusters_to_body_parts(
     # Initialize cluster assignments
     cluster_assignments: Dict[int, BodyPart] = {}
     assigned_clusters = set()
+    
+    # Add ignored clusters to assigned_clusters to exclude them from assignment
+    if ignored_clusters is None:
+        ignored_clusters = []
+    for idx in ignored_clusters:
+        if 0 <= idx < K:
+            assigned_clusters.add(idx)
+            if verbose:
+                print(f"Ignored Cluster {idx} has been excluded from assignments.")
+        else:
+            if verbose:
+                print(f"Ignored Cluster {idx} is out of bounds and cannot be excluded.")
     
     # Define the skeletal hierarchy connections
     BODY_CONNECTIONS: Dict[BodyPart, List[BodyPart]] = {
@@ -266,52 +282,51 @@ def assign_clusters_to_body_parts(
         BodyPart.LOWER_LEG_RIGHT: [
             BodyPart.FOOT_RIGHT
         ],
-        # Add more connections as needed
     }
     
     # Define direction vectors for body parts relative to their parents
-    # These vectors should point towards where the child body part is expected relative to the parent
     BODY_PART_DIRECTIONS: Dict[BodyPart, np.ndarray] = {
         BodyPart.CLAVICLE_LEFT: np.array([0, -1, 0]),  
         BodyPart.CLAVICLE_RIGHT: np.array([0.26, -1, 0]),  
-        BodyPart.HEAD: np.array([0, -1, 0]),            # Up (Negative Y)
-        BodyPart.UPPER_LEG_LEFT: np.array([-0.5, 1, 0]),  # Down-Left (Positive Y)
-        BodyPart.UPPER_LEG_RIGHT: np.array([0.5, 1, 0]),  # Down-Right (Positive Y)
-        BodyPart.SHOULDERS_LEFT: np.array([-1, 0, 0]),
-        BodyPart.SHOULDERS_RIGHT: np.array([1, 0, 0]),
-        BodyPart.NECK: np.array([0, -1, 0]),            # Up (Negative Y)
-        BodyPart.CHEST: np.array([0, -1, 0]),           # Up (Negative Y)
-        BodyPart.WAIST: np.array([0, 1, 0]),            # Down (Positive Y)
+        BodyPart.HEAD: np.array([0, -1, 0]),
+        BodyPart.UPPER_LEG_LEFT: np.array([-0.5, 1, 0]),
+        BodyPart.UPPER_LEG_RIGHT: np.array([0.5, 1, 0]),
+        BodyPart.SHOULDERS_LEFT: np.array([0, -1, 0]),
+        BodyPart.SHOULDERS_RIGHT: np.array([0, -1, 0]),
+        BodyPart.NECK: np.array([0, -1, 0]),
+        BodyPart.CHEST: np.array([0, -1, 0]), 
+        BodyPart.WAIST: np.array([0, 1, 0]), 
         BodyPart.UPPER_ARM_LEFT: np.array([-1, 0, 0]),
         BodyPart.UPPER_ARM_RIGHT: np.array([1, 0, 0]),
-        BodyPart.LOWER_ARM_LEFT: np.array([-1, 0, 0]),
-        BodyPart.LOWER_ARM_RIGHT: np.array([1, 0, 0]),
+        BodyPart.LOWER_ARM_LEFT: np.array([0, 1, 0]),
+        BodyPart.LOWER_ARM_RIGHT: np.array([0, 1, 0]),
         BodyPart.HAND_LEFT: np.array([-1, 0, 0]),
         BodyPart.HAND_RIGHT: np.array([1, 0, 0]),
         BodyPart.LOWER_LEG_LEFT: np.array([-0.5, 1, 0]),
         BodyPart.LOWER_LEG_RIGHT: np.array([0.5, 1, 0]),
         BodyPart.FOOT_LEFT: np.array([-0.5, 1, 0]),
         BodyPart.FOOT_RIGHT: np.array([0.5, 1, 0]),
-        # Add more directions as needed
     }
 
-    
     # Initialize BFS queue
     queue = deque()
     
-    # Assign the torso to cluster 5
+    # Assign the torso to cluster 5 if it's not ignored
     torso_cluster = 5
-    if torso_cluster >= K or torso_cluster < 0:
-        print(f"Error: Torso cluster index {torso_cluster} is out of bounds.")
+    if torso_cluster in ignored_clusters:
+        if verbose:
+            print(f"Torso cluster {torso_cluster} is in ignored_clusters. Cannot assign TORSO.")
+    elif 0 <= torso_cluster < K:
+        cluster_assignments[torso_cluster] = BodyPart.TORSO
+        body_part_to_cluster: Dict[BodyPart, int] = {BodyPart.TORSO: torso_cluster}
+        assigned_clusters.add(torso_cluster)
+        queue.append(BodyPart.TORSO)
+        if verbose:
+            print(f"Assigned BodyPart.TORSO to cluster {torso_cluster}.")
+    else:
+        if verbose:
+            print(f"Error: Torso cluster index {torso_cluster} is out of bounds.")
         return cluster_assignments  # Return empty assignments
-    
-    cluster_assignments[torso_cluster] = BodyPart.TORSO
-    body_part_to_cluster: Dict[BodyPart, int] = {BodyPart.TORSO: torso_cluster}
-    assigned_clusters.add(torso_cluster)
-    queue.append(BodyPart.TORSO)
-    
-    if verbose:
-        print(f"Assigned BodyPart.TORSO to cluster {torso_cluster}.")
     
     # Build KDTree with the 9D features
     tree = KDTree(combined_features)
@@ -342,11 +357,13 @@ def assign_clusters_to_body_parts(
             # Normalize the direction vector
             direction_normalized = direction / np.linalg.norm(direction)
     
-            average_distance = threshold  # You can adjust this based on data characteristics
+            average_distance = threshold
             expected_position = centers_mean[current_cluster] + direction_normalized * average_distance
 
             query_feature = combined_features[current_cluster].copy()
             query_feature[:3] = expected_position  # Update position
+    
+            # Query KDTree for nearest neighbors within the threshold
             indices = tree.query_radius([query_feature], r=threshold)[0]
     
             valid_candidates = []
@@ -362,10 +379,12 @@ def assign_clusters_to_body_parts(
                 if verbose:
                     print(f"No valid candidates found for BodyPart.{child_part.value} from Cluster {current_cluster}.")
                 continue
-
+    
+            # Select the closest valid candidate
             valid_candidates.sort(key=lambda x: x[1])
             closest_idx, closest_distance = valid_candidates[0]
-
+    
+            # Assign the cluster to the body part
             cluster_assignments[closest_idx] = child_part
             body_part_to_cluster[child_part] = closest_idx
             assigned_clusters.add(closest_idx)
