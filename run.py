@@ -11,12 +11,11 @@ import numpy as np
 import matplotlib.cm as cm
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 from scipy.spatial.transform import Rotation as R  # To handle quaternion-based rotations
 from sklearn.neighbors import KDTree
 from sklearn.metrics import pairwise_distances
 from sklearn.cluster import AgglomerativeClustering
-from dtaidistance import dtw
 from scipy.cluster.hierarchy import linkage, fcluster
 
 # types
@@ -24,6 +23,7 @@ from parameters import Parameters
 from config import Config, BaseConfig, KMeansConfig
 from features import Features
 from clustering import Clustering
+from enum import Enum
 
 ###################################################################################################
 ##   NOTE:                                                                                       ##
@@ -39,13 +39,246 @@ near, far = 0.01, 100.0
 view_scale = 3.9
 fps = 20
 
-#-------------#
-#   methods   #
-#-------------#
+#----------------------#
+#   Enumerations        #
+#----------------------#
+class BodyPart(Enum):
+    TORSO = 'torso'
+    HEAD = 'head'
+    CHEST = 'chest'
+    WAIST = 'waist'
+    SHOULDERS_LEFT = 'shoulders_left'
+    SHOULDERS_RIGHT = 'shoulders_right'
+    NECK = 'neck'
+    CLAVICLE_LEFT = 'clavicle_left'
+    CLAVICLE_RIGHT = 'clavicle_right'
+    UPPER_ARM_LEFT = 'upper_arm_left'
+    LOWER_ARM_LEFT = 'lower_arm_left'
+    HAND_LEFT = 'hand_left'
+    UPPER_ARM_RIGHT = 'upper_arm_right'
+    LOWER_ARM_RIGHT = 'lower_arm_right'
+    HAND_RIGHT = 'hand_right'
+    UPPER_LEG_LEFT = 'upper_leg_left'
+    LOWER_LEG_LEFT = 'lower_leg_left'
+    FOOT_LEFT = 'foot_left'
+    UPPER_LEG_RIGHT = 'upper_leg_right'
+    LOWER_LEG_RIGHT = 'lower_leg_right'
+    FOOT_RIGHT = 'foot_right'
+    # Add more body parts as needed
+
+#----------------------#
+#   Helper Functions   #
+#----------------------#
+
+def find_closest_cluster(clustering: Clustering, reference_idx: int, direction: str = 'down', threshold: float = 0.5) -> Optional[int]:
+    """
+    Finds the closest cluster to the reference cluster in a specified direction within a distance threshold.
+    
+    Args:
+        clustering (Clustering): Clustering information containing cluster centers.
+        reference_idx (int): Index of the reference cluster.
+        direction (str): Direction to search ('down', 'forward', 'up', 'backward', etc.).
+        threshold (float): Maximum allowable distance to consider.
+    
+    Returns:
+        Optional[int]: Index of the closest cluster in the specified direction. Returns None if not found.
+    """
+    # Compute average centers across all timesteps
+    centers = clustering.centers.mean(dim=0).cpu().numpy()  # Shape: (K, 3)
+    num_clusters = clustering.num_clusters
+    
+    # Validate reference_idx
+    if not (0 <= reference_idx < num_clusters):
+        print(f"Error: reference_idx {reference_idx} is out of bounds for number of clusters {num_clusters}.")
+        return None
+
+    reference_center = centers[reference_idx]
+
+    # Determine candidates based on direction
+    if direction == 'down':
+        candidates = np.where(centers[:, 1] < reference_center[1])[0]
+    elif direction == 'forward':
+        candidates = np.where(centers[:, 2] > reference_center[2])[0]
+    elif direction == 'up':
+        candidates = np.where(centers[:, 1] > reference_center[1])[0]
+    elif direction == 'backward':
+        candidates = np.where(centers[:, 2] < reference_center[2])[0]
+    else:
+        print(f"Warning: Unknown direction '{direction}'. No candidates found.")
+        candidates = np.array([])
+
+    if len(candidates) == 0:
+        print(f"No candidates found in direction '{direction}' for reference cluster {reference_idx}.")
+        return None
+
+    # Compute Euclidean distances to the reference cluster
+    distances = np.linalg.norm(centers[candidates] - reference_center, axis=1)
+
+    # Filter candidates within the threshold
+    valid_indices = np.where(distances < threshold)[0]
+    if len(valid_indices) == 0:
+        print(f"No candidates within threshold {threshold} in direction '{direction}' for reference cluster {reference_idx}.")
+        return None
+
+    valid_candidates = candidates[valid_indices]
+    valid_distances = distances[valid_indices]
+
+    # Find the index of the minimum distance within valid candidates
+    min_distance_idx = np.argmin(valid_distances)
+
+    closest_idx = valid_candidates[min_distance_idx]
+
+    # Additional check to ensure closest_idx is within bounds
+    if closest_idx >= num_clusters or closest_idx < 0:
+        print(f"Error: closest_idx {closest_idx} is out of bounds for number of clusters {num_clusters}.")
+        return None
+
+    return closest_idx
+
+def assign_clusters_to_body_parts(clustering: 'Clustering', scene_data: List[Dict[str, torch.Tensor]], threshold: float = 0.5) -> Dict[int, BodyPart]:
+
+    """ This is the best result we could ever get with KD-Tree + enforeced topology. I recorded the body assignment and hardcoded them ..."""
+    cluster_assignments: Dict[int, BodyPart] = {}
+
+    # manually assign
+    cluster_assignments[5] = BodyPart.TORSO
+    cluster_assignments[14] = BodyPart.HEAD
+    cluster_assignments[1] = BodyPart.WAIST
+    cluster_assignments[2] = BodyPart.UPPER_ARM_LEFT
+    cluster_assignments[25] = BodyPart.LOWER_ARM_LEFT
+    cluster_assignments[10] = BodyPart.HAND_LEFT
+    cluster_assignments[0] = BodyPart.UPPER_ARM_RIGHT
+    cluster_assignments[21] = BodyPart.LOWER_ARM_RIGHT
+    cluster_assignments[15] = BodyPart.HAND_RIGHT
+    cluster_assignments[20] = BodyPart.UPPER_LEG_LEFT
+    cluster_assignments[26] = BodyPart.LOWER_LEG_LEFT
+    cluster_assignments[12] = BodyPart.FOOT_LEFT
+    cluster_assignments[13] = BodyPart.UPPER_LEG_RIGHT
+    cluster_assignments[6] = BodyPart.LOWER_LEG_RIGHT
+    cluster_assignments[9] = BodyPart.FOOT_RIGHT
+    cluster_assignments[19] = BodyPart.SHOULDERS_LEFT
+    cluster_assignments[17] = BodyPart.SHOULDERS_RIGHT
+    cluster_assignments[11] = BodyPart.CLAVICLE_LEFT
+    cluster_assignments[3] = BodyPart.CLAVICLE_RIGHT
+
+    
+    return cluster_assignments
+
+def validate_assignments(cluster_assignments: Dict[int, BodyPart], required_parts: List[BodyPart]) -> bool:
+    """ Validates that all required body parts have been assigned. """
+    assigned_parts = set(cluster_assignments.values())
+    missing_parts = [part for part in required_parts if part not in assigned_parts]
+    
+    if missing_parts:
+        print("Missing assignments for the following body parts:")
+        for part in missing_parts:
+            print(f"- {part.value}")
+        return False
+    return True
+
+def find_skeleton_chains(clustering: Clustering, cluster_assignments: Dict[int, BodyPart]) -> List[List[int]]:
+    """ Creates chains based on predefined skeleton connections. """
+    chains: List[List[int]] = []
+    
+    # Define expected connections between body parts
+    BODY_CONNECTIONS: Dict[BodyPart, List[BodyPart]] = {
+        BodyPart.TORSO: [
+            BodyPart.CLAVICLE_LEFT,
+            BodyPart.CLAVICLE_RIGHT,
+            BodyPart.HEAD,
+            BodyPart.UPPER_LEG_LEFT,
+            BodyPart.UPPER_LEG_RIGHT
+        ],
+        BodyPart.CLAVICLE_LEFT: [
+            BodyPart.SHOULDERS_LEFT
+        ],
+        BodyPart.CLAVICLE_RIGHT: [
+            BodyPart.SHOULDERS_RIGHT
+        ],
+        BodyPart.SHOULDERS_LEFT: [
+            BodyPart.UPPER_ARM_LEFT
+        ],
+        BodyPart.SHOULDERS_RIGHT: [
+            BodyPart.UPPER_ARM_RIGHT
+        ],
+
+        BodyPart.HEAD: [
+            BodyPart.NECK
+        ],
+        BodyPart.NECK: [
+            BodyPart.CHEST
+        ],
+        BodyPart.CHEST: [
+            BodyPart.WAIST
+        ],
+        BodyPart.UPPER_ARM_LEFT: [
+            BodyPart.LOWER_ARM_LEFT
+        ],
+        BodyPart.LOWER_ARM_LEFT: [
+            BodyPart.HAND_LEFT
+        ],
+        BodyPart.UPPER_ARM_RIGHT: [
+            BodyPart.LOWER_ARM_RIGHT
+        ],
+        BodyPart.LOWER_ARM_RIGHT: [
+            BodyPart.HAND_RIGHT
+        ],
+        BodyPart.UPPER_LEG_LEFT: [
+            BodyPart.LOWER_LEG_LEFT
+        ],
+        BodyPart.LOWER_LEG_LEFT: [
+            BodyPart.FOOT_LEFT
+        ],
+        BodyPart.UPPER_LEG_RIGHT: [
+            BodyPart.LOWER_LEG_RIGHT
+        ],
+        BodyPart.LOWER_LEG_RIGHT: [
+            BodyPart.FOOT_RIGHT
+        ],
+        # Add more connections as needed
+    }
+    
+    # Reverse mapping from BodyPart to cluster index
+    body_part_to_cluster: Dict[BodyPart, int] = {v: k for k, v in cluster_assignments.items()}
+    
+    for parent_part, child_parts in BODY_CONNECTIONS.items():
+        if parent_part not in body_part_to_cluster:
+            print(f"Warning: Parent body part '{parent_part.value}' not assigned to any cluster.")
+            continue  # Parent body part not assigned
+        parent_cluster = body_part_to_cluster[parent_part]
+        for child_part in child_parts:
+            if child_part not in body_part_to_cluster:
+                print(f"Warning: Child body part '{child_part.value}' not assigned to any cluster.")
+                continue  # Child body part not assigned
+            child_cluster = body_part_to_cluster[child_part]
+            chains.append([parent_cluster, child_cluster])
+            print(f"Created chain: {parent_part.value} (Cluster {parent_cluster}) -> {child_part.value} (Cluster {child_cluster})")
+    
+    return chains
+
+def compute_joints(clustering: Clustering, cluster_chains: List[List[int]]) -> np.ndarray:
+    """ Computes the joint positions as the midpoint between connected clusters in each chain. """
+    centers_t = clustering.centers.cpu().numpy()  # Shape: (T, K, 3)
+    num_timesteps = centers_t.shape[0]
+    num_joints = len(cluster_chains)
+    
+    joints_t = np.zeros((num_timesteps, num_joints, 3))  # Shape: (T, num_joints, 3)
+    
+    for joint_idx, (parent_cluster, child_cluster) in enumerate(cluster_chains):
+        # Compute midpoints for all timesteps
+        joints_t[:, joint_idx, :] = (centers_t[:, parent_cluster, :] + centers_t[:, child_cluster, :]) / 2.0
+        print(f"Computed joint {joint_idx} between Cluster {parent_cluster} and Cluster {child_cluster}.")
+    
+    return joints_t
+
+#----------------------#
+#   Core Functions     #
+#----------------------#
+
 @torch.no_grad()
 def solve(filepath_npz: str, config: Config, save_path: str = None) -> Tuple[Dict[str, torch.Tensor], Clustering]:
     """
-    The clustering algorithm `(param_filepath, config) -> (scene_data, clustering)`. 
+    The clustering algorithm (param_filepath, config) -> (scene_data, clustering). 
     """
     
     print(F"Opening {filepath_npz}")
@@ -202,7 +435,7 @@ def initialize_cluster_center_dots(clustering, vis) -> List[o3d.geometry.Triangl
     return cluster_center_dots
 
 def update_cluster_centers(t:int, clustering:Clustering, w2c:np.ndarray, cluster_center_dots:List[o3d.geometry.TriangleMesh], vis:o3d.visualization.Visualizer):
-    """Updates the center dots visualization to timestep `t`."""
+    """Updates the center dots visualization to timestep t."""
     centers_t = clustering.centers[t].cpu()
     
     # NOTE: we project closer to the camera to be visible as an overlay
@@ -250,15 +483,46 @@ def load_scene_and_clustering(filepath: str) -> Tuple[List[Dict[str, torch.Tenso
     clustering = data['clustering']
     return scene_data, clustering
 
+def initialize_joint_dots(joints: np.ndarray, vis: o3d.visualization.Visualizer) -> List[o3d.geometry.TriangleMesh]:
+    """ Initializes the memory for the joint dots visualization. """
+    joint_dots = []
+    for _ in range(joints.shape[1]):
+        joint = o3d.geometry.TriangleMesh.create_sphere(radius=0.003)
+        joint.paint_uniform_color([1, 0, 0])
+        joint_dots.append(joint)
+        vis.add_geometry(joint)
+    
+    return joint_dots
+
+def update_joints(t: int, joints_t: np.ndarray, joint_dots: List[o3d.geometry.TriangleMesh], w2c: np.ndarray, vis: o3d.visualization.Visualizer):
+    """ Updates the joint dots visualization to the current time step t, projecting them closer to the camera. """
+    # Get the joint positions for the current time step
+    joints_at_t = joints_t[t]
+    
+    # Add homogeneous coordinates to the joint positions
+    __new_joint_points = np.concatenate([joints_at_t, np.ones((joints_at_t.shape[0], 1))], axis=-1)  # (num_joints, 4)
+
+    # Project the joint points to bring them closer to the camera
+    __new_joint_points = __new_joint_points @ w2c.T
+    __new_joint_points[:, :3] *= 0.25  # Move the points closer to the camera for visibility
+    __new_joint_points = __new_joint_points @ np.linalg.inv(w2c).T  # Reproject back to world coordinates
+
+    # Update the joint dot positions
+    for idx, joint in enumerate(joint_dots):
+        joint.translate(__new_joint_points[idx, :3], relative=False)
+        vis.update_geometry(joint)
+
 def find_nearest_neighbor_chains_all_timesteps(clustering: Clustering, max_distance: float = 0.5) -> List[List[int]]:
-    """ Find chains of clusters by considering all timesteps to determine the best adjacent cluster pairs. """
+    """ 
+    Find chains of clusters by considering all timesteps to determine the best adjacent cluster pairs.
+    """
     centers_t = clustering.centers.cpu().numpy()       # (T, K, 3)
-    dpos_t = clustering.center_dpos.cpu().numpy()      # (T, K, 3)
-    drot_t = clustering.center_drot.cpu().numpy()      # (T, K, 3)
+    dpos_t = clustering.center_dpos.cpu().numpy()            # (T, K, 3)
+    drot_t = clustering.center_drot.cpu().numpy()            # (T, K, 3)
     
     T, K, _ = centers_t.shape
     
-    # Aggregate features over all timesteps. This is bad but it does achieve a better result ...
+    # Aggregate features over all timesteps
     centers_mean = centers_t.mean(axis=0)              # (K, 3)
     centers_std = centers_t.std(axis=0)                # (K, 3)
     
@@ -319,107 +583,11 @@ def find_nearest_neighbor_chains_all_timesteps(clustering: Clustering, max_dista
     print(f"Found {len(cluster_chains)} chains of clusters.")
     return cluster_chains
 
-def compute_joints(clustering: Clustering, cluster_chains: List[List[int]]) -> np.ndarray:
-    """ Computes the joint positions as the midpoint between consecutive clusters in each chain."""
-    centers_t = clustering.centers.cpu().numpy()  # (T, K, 3)
-    num_timesteps = centers_t.shape[0]
+#----------------------#
+#      Main Function   #
+#----------------------#
 
-    # Compute the number of joints based on consecutive pairs in chains
-    num_joints = sum(len(chain) - 1 for chain in cluster_chains)
-    
-    # Initialize the joints tensor
-    joints_t = np.zeros((num_timesteps, num_joints, 3))  # (T, num_joints, 3)
-
-    joint_idx = 0
-    for chain in cluster_chains:
-        pairs = [(chain[k], chain[k + 1]) for k in range(len(chain) - 1)]
-
-        for i, j in pairs:
-            # Vectorized midpoint computation for all timesteps
-            joints_t[:, joint_idx, :] = (centers_t[:, i, :] + centers_t[:, j, :]) / 2.0
-            joint_idx += 1
-
-    print(f"Computed {num_joints} joints.")
-    return joints_t
-
-def initialize_joint_dots(joints: np.ndarray, vis: o3d.visualization.Visualizer) -> List[o3d.geometry.TriangleMesh]:
-    """ Initializes the memory for the joint dots visualization. """
-    joint_dots = []
-    for _ in range(joints.shape[1]):
-        joint = o3d.geometry.TriangleMesh.create_sphere(radius=0.003)
-        joint.paint_uniform_color([1, 0, 0])
-        joint_dots.append(joint)
-        vis.add_geometry(joint)
-    
-    return joint_dots
-
-def update_joints(t: int, joints_t: np.ndarray, joint_dots: List[o3d.geometry.TriangleMesh], w2c: np.ndarray, vis: o3d.visualization.Visualizer):
-    """ Updates the joint dots visualization to the current time step `t`, projecting them closer to the camera. """
-    # Get the joint positions for the current time step
-    joints_at_t = joints_t[t]
-    
-    # Add homogeneous coordinates to the joint positions
-    __new_joint_points = np.concatenate([joints_at_t, np.ones((joints_at_t.shape[0], 1))], axis=-1)  # (num_joints, 4)
-
-    # Project the joint points to bring them closer to the camera
-    __new_joint_points = __new_joint_points @ w2c.T
-    __new_joint_points[:, :3] *= 0.25  # Move the points closer to the camera for visibility
-    __new_joint_points = __new_joint_points @ np.linalg.inv(w2c).T  # Reproject back to world coordinates
-
-    # Update the joint dot positions
-    for idx, joint in enumerate(joint_dots):
-        joint.translate(__new_joint_points[idx, :3], relative=False)
-        vis.update_geometry(joint)
-
-
-#@GPT
-def update_lineset(t:int, clustering:Clustering, w2c:np.ndarray, xform_lineset:o3d.geometry.LineSet, vis:o3d.visualization.Visualizer):
-    """Updates the xform lineset visualization to timestep `t`."""
-    centers_t = clustering.centers[t]  # Assuming you have access to this
-    xforms_t = clustering.transformations[t]  # Get transformations for this time step
-
-    new_cluster_center_xform_points = np.zeros((4 * clustering.num_clusters, 3))  # 4 points per cluster
-
-    for c in range(clustering.num_clusters):
-        # Extract the origin (translation) for cluster `c`
-        origin = centers_t[c].cpu().numpy()
-
-        # Extract the rotation as a quaternion [qw, qx, qy, qz]
-        quaternion = xforms_t[c, 3:7].cpu().numpy()  # Extract [qw, qx, qy, qz]
-        
-        # Create a Rotation object from the quaternion (note the order for SciPy)
-        rotation = R.from_quat(quaternion[[1, 2, 3, 0]])  # [qx, qy, qz, qw]
-        
-        # Define unit vectors for local X, Y, Z axes in the cluster's local frame
-        local_x = np.array([0.2, 0, 0])  # X-axis unit vector scaled for visibility
-        local_y = np.array([0, 0.2, 0])  # Y-axis unit vector
-        local_z = np.array([0, 0, 0.2])  # Z-axis unit vector
-        
-        # Rotate the unit vectors from local cluster frame to world coordinates
-        world_x = rotation.apply(local_x)  # Rotate the X-axis unit vector
-        world_y = rotation.apply(local_y)  # Rotate the Y-axis unit vector
-        world_z = rotation.apply(local_z)  # Rotate the Z-axis unit vector
-
-        # Set the new points in world space
-        new_cluster_center_xform_points[4 * c] = origin  # Cluster center
-        new_cluster_center_xform_points[4 * c + 1] = origin + world_x  # X-axis in world coordinates
-        new_cluster_center_xform_points[4 * c + 2] = origin + world_y  # Y-axis in world coordinates
-        new_cluster_center_xform_points[4 * c + 3] = origin + world_z  # Z-axis in world coordinates
-
-    # Projection: project the points closer to the camera to ensure visibility
-    homogeneous_points = np.hstack([new_cluster_center_xform_points, np.ones((4 * clustering.num_clusters, 1))])  # Add homogeneous coord
-    projected_points = homogeneous_points @ w2c.T  # Apply world-to-camera transformation
-    projected_points[:, :3] *= 0.25  # Scale points down to move closer to the camera
-    projected_points = projected_points @ np.linalg.inv(w2c).T  # Reproject back to world coordinates
-    new_cluster_center_xform_points = projected_points[:, :3]  # Extract 3D coordinates
-
-    # Update the LineSet points
-    xform_lineset.points = o3d.utility.Vector3dVector(new_cluster_center_xform_points)
-    
-    # Update the visualization
-    vis.update_geometry(xform_lineset)
-
-def main(filepath_npz: str, config: Config, clustering_filepath: str = None , save_path: str = "clustering.npz"):
+def main(filepath_npz: str, config: Config, clustering_filepath: str = "clustering.npz" , save_path: str = "clustering.npz"):
     joint = True
     if clustering_filepath is not None:
         print("Loading clustering from file.")
@@ -428,6 +596,27 @@ def main(filepath_npz: str, config: Config, clustering_filepath: str = None , sa
         print("Running clustering algorithm.")
         scene_data, clustering = solve(filepath_npz, config, save_path=save_path)
 
+    # Assign clusters to body parts with a defined threshold
+    cluster_assignments = assign_clusters_to_body_parts(clustering, scene_data, threshold=0.5)
+
+    # Validate Assignments (Optional)
+    required_parts = [
+        BodyPart.TORSO, BodyPart.HEAD, BodyPart.NECK, BodyPart.UPPER_ARM_LEFT, BodyPart.UPPER_ARM_RIGHT,
+        BodyPart.LOWER_ARM_LEFT, BodyPart.LOWER_ARM_RIGHT, BodyPart.HAND_LEFT, BodyPart.HAND_RIGHT,
+        BodyPart.UPPER_LEG_LEFT, BodyPart.UPPER_LEG_RIGHT, BodyPart.LOWER_LEG_LEFT, BodyPart.LOWER_LEG_RIGHT,
+        BodyPart.FOOT_LEFT, BodyPart.FOOT_RIGHT, BodyPart.CHEST, BodyPart.WAIST, BodyPart.SHOULDERS_LEFT,
+        BodyPart.SHOULDERS_RIGHT, BodyPart.CLAVICLE_LEFT, BodyPart.CLAVICLE_RIGHT
+    ]
+    if not validate_assignments(cluster_assignments, required_parts):
+        print("Warning: Not all required body parts have been assigned.")
+
+    # Find skeleton-based chains based on assignments
+    cluster_chains = find_skeleton_chains(clustering, cluster_assignments)
+
+    # Compute joints based on skeleton chains
+    joints_t = compute_joints(clustering, cluster_chains)
+
+    # Proceed with visualization as before
     vis = o3d.visualization.Visualizer()
     vis.create_window(width=int(w * view_scale), height=int(h * view_scale), visible=True)
 
@@ -447,15 +636,13 @@ def main(filepath_npz: str, config: Config, clustering_filepath: str = None , sa
     cluster_center_dots = initialize_cluster_center_dots(clustering, vis)
     xform_lineset = initialize_xform_lineset(clustering, vis)
 
-
     #----------------------#
     #     Evan's Joint     #
     #----------------------#
     # Add joint initialization
     if joint: 
-        cluster_chains = find_nearest_neighbor_chains_all_timesteps(clustering, max_distance=0.5)
-        joints_t = compute_joints(clustering, cluster_chains)
-
+        # Use cluster_chains from skeleton assignment
+        # joints_t already computed
         joint_dots = initialize_joint_dots(joints_t, vis)
 
     #----------------------#
@@ -501,7 +688,6 @@ def main(filepath_npz: str, config: Config, clustering_filepath: str = None , sa
         vis.update_geometry(pcd)
 
         update_cluster_centers(t, clustering, w2c, cluster_center_dots, vis)
-        update_lineset(t, clustering, w2c, xform_lineset, vis)
 
         #----------------------#
         #     Evan's Joint     #
@@ -518,6 +704,9 @@ def main(filepath_npz: str, config: Config, clustering_filepath: str = None , sa
     del vis
     del render_options
 
+#----------------------#
+#   Execution Block    #
+#----------------------#
 import sys
 if __name__ == "__main__":
     config = KMeansConfig(
