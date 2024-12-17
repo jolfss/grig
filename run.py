@@ -3,7 +3,7 @@
 #og imports
 import time
 import open3d as o3d
-from visualize import init_camera, render, rgbd2pcd 
+from visualize import render, rgbd2pcd 
 import torch
 import numpy as np
 
@@ -11,6 +11,7 @@ import numpy as np
 import os
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
+import matplotlib.image as mpimg
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -38,10 +39,33 @@ from clustering import Clustering
 #   global constants   #
 #----------------------#
 # camera configuration
-w, h = 640, 360
+w, h = 350,350
 near, far = 0.01, 100.0
-view_scale = 3.9
-fps = 15
+view_scale = 1
+fps = 20
+
+def_pix = torch.tensor(
+    np.stack(np.meshgrid(np.arange(w) + 0.5, np.arange(h) + 0.5, 1), -1).reshape(-1, 3)).cuda().float()
+pix_ones = torch.ones(h * w, 1).cuda().float()
+
+def init_camera(y_angle=0., center_dist=2.4, cam_height=1.3, f_ratio=0.82, 
+                cam_right=0.5, zoom_factor=1.5):
+    ry = y_angle * np.pi / 180
+    # Move camera to the right by cam_right
+    w2c = np.array([
+        [np.cos(ry), 0., -np.sin(ry), cam_right],
+        [0.,         1., 0.,          cam_height],
+        [np.sin(ry), 0., np.cos(ry),  center_dist],
+        [0.,         0., 0.,          1.]
+    ])
+    # Zoom in by zoom_factor
+    k = np.array([
+        [f_ratio * w * zoom_factor, 0,                          w / 2],
+        [0,                         f_ratio * w * zoom_factor,  h / 2],
+        [0,                         0,                          1]
+    ])
+    return w2c, k
+
 
 #-------------#
 #   methods   #
@@ -338,7 +362,11 @@ def analyze_cluster_adjacency(masks, np_fg_features, np_fg_feature_means, save_p
         if mask_sum > 0:
             matrix[i] /= mask_sum
 
-    if show or save_path:
+    if save_path:
+        matrix_8bit = (matrix * 255).astype(np.uint8)
+        mpimg.imsave(save_path, matrix_8bit, cmap='Greys_r')
+
+    elif show:
         plt.figure(figsize=(6, 6))
         plt.imshow(matrix, origin='upper', cmap='Greys_r')
         plt.title("Asymmetric Normalized 2D Matrix of 1NN and 2NN Counts")
@@ -347,10 +375,7 @@ def analyze_cluster_adjacency(masks, np_fg_features, np_fg_feature_means, save_p
         plt.grid(False)
         plt.tight_layout()
 
-        if save_path:
-            plt.savefig(save_path, dpi=300)
-        if show:
-            plt.show()
+        plt.show()
         plt.close()
 
     return matrix
@@ -812,7 +837,7 @@ def initialize_adjacency_lineset_offscreen(distance_matrix: np.ndarray, clusteri
 
     adj_lineset.lines = o3d.utility.Vector2iVector(adj_lines)
     # We'll set points later when we have camera transformations, if needed.
-    adj_lineset.paint_uniform_color([1, 1, 0])
+    adj_lineset.paint_uniform_color([0, 0, 0])
 
     # IMPORTANT: Do NOT add to vis here, just return geometry and adjacency.
     return adj_lineset, adj
@@ -829,7 +854,7 @@ def update_adjacency_lineset_offscreen(t: int, clustering, w2c: np.ndarray, adj_
     __new_cluster_center_points = __new_cluster_center_points @ np.linalg.inv(w2c).T
 
     adj_lineset.points = o3d.utility.Vector3dVector(__new_cluster_center_points[:, :3])
-    adj_lineset.paint_uniform_color([1, 1, 0])
+    adj_lineset.paint_uniform_color([0, 0, 0])
 
     # Remove old geometry and re-add the updated one
     renderer.scene.remove_geometry(name)
@@ -841,7 +866,7 @@ def initialize_cluster_center_dots_offscreen(clustering) -> List[o3d.geometry.Tr
     cluster_center_dots = []
     for _ in range(clustering.num_clusters):
         center = o3d.geometry.TriangleMesh.create_sphere(radius=0.003)
-        center.paint_uniform_color([1, 1, 1])
+        center.paint_uniform_color([0,0,0])
         cluster_center_dots.append(center)
     return cluster_center_dots
 
@@ -898,19 +923,20 @@ def update_cluster_centers_offscreen(
         if colors is not None:
             old_mesh.paint_uniform_color(colors[c])
         else:
-            old_mesh.paint_uniform_color([1,1,1])
+            old_mesh.paint_uniform_color([0,0,0])
 
         # Re-add geometry with the same name and material
         renderer.scene.remove_geometry(names[c])
         renderer.scene.add_geometry(names[c], old_mesh, materials[c])
 
-@torch.no_grad()
+
+torch.no_grad()
 def capture_timestep_offscreen(filepath_npz: str, config, save_name: str, timestep: int = 0):
     # Load scene data
     scene_data, clustering, miscellaneous = solve(filepath_npz, config, silent=True)
 
     # Initialize camera
-    w2c, k = init_camera()
+    w2c, k = init_camera(y_angle=0., center_dist=3.7, cam_height=0.93, f_ratio=1.50, cam_right=-0.05, zoom_factor=1.5)
     width = int(w * view_scale)
     height = int(h * view_scale)
 
@@ -918,7 +944,7 @@ def capture_timestep_offscreen(filepath_npz: str, config, save_name: str, timest
     renderer = o3d.visualization.rendering.OffscreenRenderer(width, height)
     renderer.scene.scene.set_indirect_light_intensity(0.0)
     renderer.scene.scene.set_sun_light([0, 0, -1], [1, 1, 1], 0.0)
-
+    renderer.scene.set_background([0, 0, 0, 1])  # RGBA black background
 
     # Render initial scene data (timestep = 0)
     im, depth = render(w2c, k, scene_data[0])
@@ -929,8 +955,10 @@ def capture_timestep_offscreen(filepath_npz: str, config, save_name: str, timest
 
     # Define a material for unlit rendering
     mat = o3d.visualization.rendering.MaterialRecord()
-    #mat.shader = "defaultUnlit"
+    mat.shader = "defaultUnlit"
     mat.point_size = float(view_scale)
+    mat.base_color = [0.9, 0.9, 0.9, 1.0]
+    mat.line_width = 5.0
 
     # Add pointcloud to the scene
     renderer.scene.add_geometry("pointcloud", pcd, mat)
@@ -947,21 +975,34 @@ def capture_timestep_offscreen(filepath_npz: str, config, save_name: str, timest
         dot_materials.append(mat)
         renderer.scene.add_geometry(name, ccdot, mat)
 
-    # Compute adjacency matrix and save figure
-    distances = pairwise_distances(miscellaneous['np_fg_features'], miscellaneous['np_fg_feature_means'])
+    distances = pairwise_distances(miscellaneous["np_fg_features"], miscellaneous["np_fg_feature_means"])
     sorted_clusters = distances.argsort(axis=1)
     _1NN_ids = sorted_clusters[:, 0]
     _2NN_ids = sorted_clusters[:, 1]
 
+
+
     cluster_adjacency_matrix = np.zeros((config.K, config.K), dtype=float)
     for i, j in zip(_1NN_ids, _2NN_ids):
         cluster_adjacency_matrix[i, j] += 1
-
-    for i in np.unique(_1NN_ids):
+    
+    for i in np.unique(_1NN_ids):  
         mask_sum = torch.sum(clustering.masks[i]).item()
         if mask_sum > 0:
             cluster_adjacency_matrix[i] /= mask_sum
 
+    # get me the mean of the entropies of each row of cluster_adjacency_matrix
+    def shannon_entropy(p_row):
+        # Ensure no negative or NaN values
+        p_row = np.clip(p_row, 0, 1)
+        # Filter out zero probabilities to avoid log(0)
+        mask = p_row > 0
+        p = p_row[mask]
+        # Compute entropy in bits
+        return -np.sum(p * np.log2(p))
+
+    # Assuming cluster_adjacency_matrix is a 2D NumPy array
+    mean_entropy = np.mean([shannon_entropy(row) for row in cluster_adjacency_matrix])
     plt.figure(figsize=(6, 6))
     plt.imshow(cluster_adjacency_matrix, origin='upper', cmap='Greys_r')
     plt.title("Asymmetric Normalized 2D Matrix of 1NN and 2NN Counts")
@@ -1026,7 +1067,6 @@ def capture_timestep_offscreen(filepath_npz: str, config, save_name: str, timest
     img = renderer.render_to_image()
     if not os.path.exists("hpsearch/renders"):
         os.makedirs("hpsearch/renders")
-    o3d.io.write_image(f"hpsearch/renders/{save_name}.png", img)
+    o3d.io.write_image(f"hpsearch/renders/{save_name}_ENT={mean_entropy}.png", img)
 
     del renderer
-

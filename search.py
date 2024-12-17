@@ -41,7 +41,7 @@ def barycentric_sampler(n):
 
 if __name__ == "__main__":
     K=28
-    for x,y, POS,DPOS,DROT in tqdm(barycentric_sampler(10)):
+    for x,y, POS,DPOS,DROT in tqdm(list(barycentric_sampler(32))):
 
         base_config = \
         {
@@ -60,11 +60,11 @@ if __name__ == "__main__":
 
         for config in \
         [
-            KMeansConfig(K=K,**base_config),
-            #KMedoidsConfig(K=K, sample_size=2000,samplings=10,**base_config)
+            #KMeansConfig(K=K,**base_config),
+            KMedoidsConfig(K=K, sample_size=1000,samplings=3,**base_config)
         ]:\
         {
-            capture_timestep_offscreen(F"./output/pretrained/softball/params.npz", config,F"{x}_{y}_POS-{POS}_DPOS-{DPOS}_DROT-{DROT}", timestep=60)
+            capture_timestep_offscreen(F"./output/pretrained/softball/params.npz", config,F"{x}_{y}_POS={POS}_DPOS={DPOS}_DROT={DROT}", timestep=36)
             
         }
             
