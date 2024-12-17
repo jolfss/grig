@@ -1,4 +1,6 @@
 # GRIG: Joint-solver result with KD-tree and enforced human topology
+Uncomment this line in the third cell in >run.ipynb to load the best result saved in the .npz file:
+> # cluster_assignments = grig.assign_clusters_to_body_parts_from_file(assignments_filepath)
 
 # Dynamic 3D Gaussians: Tracking by Persistent Dynamic View Synthesis
 ### [Project Page](https://dynamic3dgaussians.github.io/) | [Paper](https://arxiv.org/pdf/2308.09713.pdf) | [ArXiv](https://arxiv.org/abs/2308.09713) | [Tweet Thread](https://twitter.com/JonathonLuiten/status/1692346451668636100) | [Data](https://omnomnom.vision.rwth-aachen.de/data/Dynamic3DGaussians/data.zip) | [Pretrained Models](https://omnomnom.vision.rwth-aachen.de/data/Dynamic3DGaussians/output.zip)
