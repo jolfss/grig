@@ -1,3 +1,24 @@
+# NOTE: Heavily WIP
+
+**Authors:** Sean Brynjólfsson, Evan Zhang, Justin Tien-Smith
+
+Recently, techniques for solving gaussian splats of dynamic scenes ([Dynamic3DGaussians, 2024](https://dynamic3dgaussians.github.io/) have found success in using local rigidity constraints to enforce spatial and temporal consistency.
+
+We use this detailed representation and decompose it into the rigid parts and joints which describe their movement. This procedure makes no assumptions about the anatomy of the dynamic entities within the scene and therefore should work equally well for all people, animals, machines---anything that moves about a discrete set of joints. We're currently implementing the joint solver after getting promising results for our clustering algorithm to find the bones.
+
+Our final deliverable will be an animation-ready gaussian rig and a portable format for them. Clustering also massively downsizes the storage requirements because local rigidity means gaussians are predictive of their neighbors---no need to track all of them. We are also developing more visualizations to help understand the limitations of the representation present. In doing so, we have spotted some new failure modes of the original method, like how some regions gradually creep into neighboring regions over time. 
+
+![](grig1.gif)
+
+![](grig2.gif)
+
+![](grig3.gif)
+
+Original `README.md` below:
+---
+
+
+
 # Dynamic 3D Gaussians: Tracking by Persistent Dynamic View Synthesis
 ### [Project Page](https://dynamic3dgaussians.github.io/) | [Paper](https://arxiv.org/pdf/2308.09713.pdf) | [ArXiv](https://arxiv.org/abs/2308.09713) | [Tweet Thread](https://twitter.com/JonathonLuiten/status/1692346451668636100) | [Data](https://omnomnom.vision.rwth-aachen.de/data/Dynamic3DGaussians/data.zip) | [Pretrained Models](https://omnomnom.vision.rwth-aachen.de/data/Dynamic3DGaussians/output.zip)
 Official implementation of our approach for modelling the dynamic 3D world as a set of 3D Gaussians that move & rotate over time. This extends Gaussian Splatting to dynamic scenes, with accurate novel-view synthesis and dense 3D 6-DOF tracking.<br><br>
